@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  smoke-test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install package
+        run: |
+          python -m pip install --upgrade pip
+          pip install .[h5ad]
+
+      - name: Verify console entry points
+        run: |
+          stereocell-run --help > /dev/null
+          stereocell-nuclei-segment --help > /dev/null
+          stereocell-cell-segment --help > /dev/null
+
+      - name: Run smoke test (synthetic StereoCell data, full pipeline)
+        run: stereocell-run --smoke-test --outdir smoke_out --force
+
+      - name: Validate outputs
+        run: |
+          python - <<'EOF'
+          import json, os
+          need = ["seeds_overlay.png", "cells_overlay.png",
+                  "matrix_updated.csv.gz", "qc_report.json"]
+          for f in need:
+              p = os.path.join("smoke_out", f)
+              assert os.path.exists(p), f"缺少输出: {p}"
+          qc = json.load(open("smoke_out/qc_report.json"))
+          print(json.dumps(qc, indent=2, default=str))
+          assert qc["frac_mols_assigned"] > 0.75, \
+              f"分子归属率过低: {qc['frac_mols_assigned']:.3f}"
+          assert qc["n_seeds"] >= 200, f"核检出数异常: {qc['n_seeds']}"
+          h5 = [f for f in os.listdir("smoke_out") if f.endswith((".h5ad", ".mtx"))]
+          assert h5, "缺少细胞×基因矩阵输出"
+          print("CI 冒烟测试通过:", h5)
+          EOF

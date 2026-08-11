@@ -1,5 +1,8 @@
 # StereoCell 细胞分割流程（集群版）
 
+[![CI](https://github.com/CozyGalaxy/stereocell-pipeline/actions/workflows/ci.yml/badge.svg)](https://github.com/CozyGalaxy/stereocell-pipeline/actions/workflows/ci.yml)
+[![release](https://img.shields.io/github/v/release/CozyGalaxy/stereocell-pipeline)](https://github.com/CozyGalaxy/stereocell-pipeline/releases/tag/v1.0.0)
+
 输入（均来自 StereoCell 技术）：
 1. **ssDNA 灰度图像**（核染色，鉴定细胞核位置）
 2. **逐像素表达矩阵**：`geneID, x, y, MIDCount, ExonCount, label`（首行为 title；`label=0/0.0` 表示无细胞；其余为预分配细胞 ID——纯数字或带前缀字符串如 `Sample.chip.2803`，**不准确**，需用 ssDNA 校准）
