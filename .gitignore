@@ -1,0 +1,19 @@
+# ---- 数据与运行产物 (不入库) ----
+test_data/
+test_out/
+real_demo/
+smoke_out/
+smoke_out2/
+*.log
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.eggs/
+
+# ---- 系统 ----
+.DS_Store
+Thumbs.db

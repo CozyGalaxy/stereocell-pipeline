@@ -1,0 +1,11 @@
+numpy>=1.24
+scipy>=1.10
+scikit-image>=0.21
+tifffile>=2023.7
+pandas>=2.0
+matplotlib>=3.7
+anndata>=0.9
+# 可选 GPU:
+# torch (CUDA 版, 从 pytorch.org 对应源安装)
+# cellpose>=4.0  (Cellpose-SAM 核分割后端)
+# pyarrow (parquet 输入输出)
