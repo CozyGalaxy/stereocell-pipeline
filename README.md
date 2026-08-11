@@ -73,6 +73,16 @@ python cell_segment.py ... --nuclei-mask out_nuclei/nuclei_mask.tif
 - `cells_x_genes.h5ad` — 过滤后细胞×基因稀疏矩阵（scanpy 直接可读）
 - 中间结果：`01_nuclei_mask.tif`、`03_diffusion_fit.png`、`04_cell_params.csv`、`qc_report.json`
 
+## 算法文档
+
+流程背后的算法调研与实测结论（来自 `st-cell-segmentation` skill 知识库）：
+
+- [docs/stereocell.md](docs/stereocell.md) — StereoCell 分割策略与自适应 EM 原型的模拟实测（边际拒绝 vs 硬截断等关键决策依据）
+- [docs/segmentation-strategies.md](docs/segmentation-strategies.md) — 三类输入（仅图像 / 仅表达 / 联合）分割算法对比
+- [docs/rna-diffusion.md](docs/rna-diffusion.md) — RNA 扩散建模与背景污染处理
+- [docs/registration.md](docs/registration.md) — 图像-矩阵配准算法（STalign / trackline / imreg_dft）
+- [docs/tool-playbooks.md](docs/tool-playbooks.md) — CellBin2 / Cellpose-SAM / Baysor / BIDCell / DeepCell 等工具适用场景
+
 ## 依赖
 
 - Python ≥3.10；numpy、scipy、scikit-image、tifffile、pandas、matplotlib
