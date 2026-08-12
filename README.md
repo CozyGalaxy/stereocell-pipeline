@@ -119,7 +119,16 @@ stereocell-run             --smoke-test --outdir /tmp/scell_smoke
 
 ## 集群运行
 
-- 大数据建议：内存 ≈ 分子数 × 40 B + 候选对 × 24 B；1 亿分子约需 8–16 GB RAM；EM 已全向量化（候选对排序 + reduceat），CPU 每千万分子·迭代约秒级。
+- **先试跑再全量**：用 `crop_region.py` 从全尺寸数据裁剪子区域（自动选最密/中位密度窗口，坐标重定基，可靠列表同步裁剪，输出可直接用于训练的 manifest）：
+
+```bash
+python crop_region.py --ssdna big.tif --matrix big.txt.gz \
+    --reliable solid.cell.list --outdir pilot/ --size 6000 --auto dense
+python cell_segment.py --ssdna pilot/crop_ssdna.tif --matrix pilot/crop_matrix.txt.gz \
+    --reliable pilot/crop_reliable.list --outdir pilot/cells/
+```
+
+- 大数据建议：内存 ≈ 分子数 × 40 B + 候选对 × 24 B；1 亿分子约需 8–16 GB RAM；EM 已全向量化（候选对排序 + reduceat）。23500² / 8000 细胞 / ~3 亿分子规模资源评估：CPU 64 GB 节点 1.5–3 h；CUDA（≥24 GB 显存）1–2 h。
 - 冒烟自检（部署后先跑）：`python run_pipeline.py --smoke-test --outdir /tmp/scell_smoke`。
 - 传统单步入口 `run_pipeline.py`（无训练/QC/合胞体功能）保留兼容；SLURM 示例见 `slurm_example.sh`。
 

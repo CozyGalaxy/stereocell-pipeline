@@ -22,7 +22,7 @@ setup(
     python_requires=">=3.10",
     packages=find_packages(include=["scell", "scell.*"]),
     py_modules=["nuclei_train", "nuclei_segment", "cell_train", "cell_segment",
-                "run_pipeline"],
+                "run_pipeline", "crop_region"],
     install_requires=[
         "numpy>=1.24",
         "scipy>=1.10",
@@ -44,6 +44,7 @@ setup(
             "stereocell-cell-train=cell_train:main",
             "stereocell-cell-segment=cell_segment:main",
             "stereocell-run=run_pipeline:main",
+            "stereocell-crop=crop_region:main",
         ],
     },
     classifiers=[
