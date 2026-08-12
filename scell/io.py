@@ -26,7 +26,12 @@ def load_expression(path):
     if p.endswith(".parquet"):
         df = pd.read_parquet(p)
     else:
-        df = pd.read_csv(p, sep=None, engine="python", compression="infer")
+        # 从首行判定分隔符, 用 C 引擎 (python 引擎在亿级行上慢 10 倍以上)
+        with _open(p) as fh:
+            header = fh.readline()
+        sep = "\t" if "\t" in header else ","
+        df = pd.read_csv(p, sep=sep, engine="c", compression="infer",
+                         dtype={"geneID": str})
     # 容忍列顺序/多余空白: 按名称取列
     df.columns = [c.strip() for c in df.columns]
     genes, gene_codes = np.unique(df["geneID"].fillna("NA").map(str).values,
@@ -73,8 +78,9 @@ def reliable_label_ids(reliable):
     return ids
 
 
-def write_updated_matrix(src_path, out_path, new_cell_id, compression="gzip"):
-    """按原始行序把 label 列替换为 new_cell_id, 流式写出(内存安全)。
+def write_updated_matrix(src_path, out_path, new_cell_id, compression="gzip",
+                         chunk=5_000_000):
+    """按原始行序把 label 列替换为 new_cell_id, 分块写出(内存安全)。
     new_cell_id: int32 数组, 长度 = 矩阵行数, 0 = 背景/拒收。
     """
     p = str(src_path)
@@ -83,20 +89,24 @@ def write_updated_matrix(src_path, out_path, new_cell_id, compression="gzip"):
         df["label"] = new_cell_id
         df.rename(columns={"label": "cell_id"}).to_parquet(out_path, index=False)
         return
-    fin = _open(p)
-    fout = gzip.open(out_path, "wt") if str(out_path).endswith(".gz") else open(out_path, "w")
-    header = fin.readline()
+    with _open(p) as fh:
+        header = fh.readline()
     sep = "\t" if "\t" in header else ","
     cols = [c.strip() for c in header.strip().split(sep)]
-    fout.write(sep.join(cols[:-1] + ["cell_id"]) + "\n")
-    i = 0
-    for line in fin:
-        parts = line.rstrip("\n").split(sep)
-        parts[-1] = str(int(new_cell_id[i]))
-        fout.write(sep.join(parts) + "\n")
-        i += 1
-    fin.close(); fout.close()
-    assert i == len(new_cell_id), f"行数不匹配: 写入了{i}, 赋值数组{len(new_cell_id)}"
+    out_cols = cols[:-1] + ["cell_id"]
+    fout = gzip.open(out_path, "wt") if str(out_path).endswith(".gz") else open(out_path, "w")
+    i, first, total = 0, True, 0
+    for df in pd.read_csv(p, sep=sep, engine="c", compression="infer",
+                          chunksize=chunk, dtype={"geneID": str}):
+        n = len(df)
+        df = df.iloc[:, :-1].copy()
+        df["cell_id"] = new_cell_id[i:i + n]
+        df.to_csv(fout, sep=sep, index=False, header=first, columns=out_cols)
+        first = False
+        i += n
+        total += n
+    fout.close()
+    assert total == len(new_cell_id), f"行数不匹配: 写入了{total}, 赋值数组{len(new_cell_id)}"
 
 
 def save_cell_by_gene(out_prefix, cell_ids, genes, gene_codes, mid, assign, conf=None):

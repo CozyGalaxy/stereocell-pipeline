@@ -1,0 +1,17 @@
+{
+  "n_molecules": 91347,
+  "n_genes": 60,
+  "n_seeds": 280,
+  "n_reliable": 43,
+  "lambda_px": 10.498534631381657,
+  "r95_px": 31.450799020254284,
+  "D_ISO_px": 33.16743834924821,
+  "frac_isolated": 0.7142857142857143,
+  "frac_mols_assigned": 0.861024445247244,
+  "median_conf": 0.9998390078544617,
+  "outputs": {
+    "updated_matrix": "smoke_out3\\matrix_updated.csv.gz",
+    "cell_by_gene": "smoke_out3\\cells_x_genes.h5ad",
+    "cell_mask": "smoke_out3\\06_cell_mask.tif"
+  }
+}
