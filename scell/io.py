@@ -27,11 +27,12 @@ def load_expression(path):
         df = pd.read_parquet(p)
     else:
         # 从首行判定分隔符, 用 C 引擎 (python 引擎在亿级行上慢 10 倍以上)
+        # keep_default_na=False: "nan"/"null"/"NA" 是合法基因名 (如果蝇 nan=nanos), 不得转为 NaN
         with _open(p) as fh:
             header = fh.readline()
         sep = "\t" if "\t" in header else ","
         df = pd.read_csv(p, sep=sep, engine="c", compression="infer",
-                         dtype={"geneID": str})
+                         dtype={"geneID": str}, keep_default_na=False)
     # 容忍列顺序/多余空白: 按名称取列
     df.columns = [c.strip() for c in df.columns]
     genes, gene_codes = np.unique(df["geneID"].fillna("NA").map(str).values,
@@ -94,10 +95,16 @@ def write_updated_matrix(src_path, out_path, new_cell_id, compression="gzip",
     sep = "\t" if "\t" in header else ","
     cols = [c.strip() for c in header.strip().split(sep)]
     out_cols = cols[:-1] + ["cell_id"]
-    fout = gzip.open(out_path, "wt") if str(out_path).endswith(".gz") else open(out_path, "w")
+    # newline="": csv 写出器自带 \r\n, 文本模式默认换行转换会在 Windows 写成 \r\r\n
+    if str(out_path).endswith(".gz"):
+        fout = gzip.open(out_path, "wt", newline="")
+    else:
+        fout = open(out_path, "w", newline="")
     i, first, total = 0, True, 0
+    # keep_default_na=False: 同上, "nan"/"null" 等是合法基因名, 必须原样保留
     for df in pd.read_csv(p, sep=sep, engine="c", compression="infer",
-                          chunksize=chunk, dtype={"geneID": str}):
+                          chunksize=chunk, dtype={"geneID": str},
+                          keep_default_na=False):
         n = len(df)
         df = df.iloc[:, :-1].copy()
         df["cell_id"] = new_cell_id[i:i + n]

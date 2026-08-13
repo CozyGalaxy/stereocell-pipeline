@@ -121,8 +121,10 @@ def main():
     n_in = 0
     with gzip.open(p_mat, "wt") as fout:
         first = True
+        # keep_default_na=False: "nan"/"null" 是合法基因名, 不得转 NaN 后写成空
         for df in pd.read_csv(args.matrix, sep=sep, engine="c", compression="infer",
-                              chunksize=args.chunk, dtype={"geneID": str}):
+                              chunksize=args.chunk, dtype={"geneID": str},
+                              keep_default_na=False):
             m = (df.x >= x0) & (df.x < x0 + s) & (df.y >= y0) & (df.y < y0 + s)
             if not m.any():
                 continue

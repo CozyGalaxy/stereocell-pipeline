@@ -88,19 +88,27 @@ def main():
     iy = np.clip(expr["y"], 0, nuclei.shape[0] - 1)
     mol_nuc = nuclei[iy, ix]
     if not (os.path.exists(p_seedqc) and not args.force):
+        # 向量化实现 (原逐种子循环在 1.6 亿分子 / 1.6 万种子规模下需 ~53 分钟)
+        n_seed = int(nuclei.max())
+        n_mols_arr = np.bincount(mol_nuc, minlength=n_seed + 1)
+        # 每核 modal 预分配 label: 组合 key = nuc * (lab_max+1) + lab 后 bincount
+        lab = expr["label"]
+        lab_max = int(lab.max()) if lab.size else 0
+        modal = np.zeros(n_seed + 1, np.int64)
+        sel = (mol_nuc > 0) & (lab > 0)
+        if sel.any() and lab_max > 0:
+            key = mol_nuc[sel].astype(np.int64) * (lab_max + 1) + lab[sel]
+            cnt = np.bincount(key, minlength=(n_seed + 1) * (lab_max + 1)
+                              ).reshape(n_seed + 1, lab_max + 1)
+            modal = cnt.argmax(axis=1)
+            modal[cnt.max(axis=1) == 0] = 0
         with open(p_seedqc, "w") as f:
             f.write("seed_id,area_px,n_mols_in_nucleus,matched_prelab,reliable\n")
             for k, sid in enumerate(ids):
-                m = mol_nuc == sid
-                labs = expr["label"][m]
-                labs = labs[labs > 0]
-                pre = ""
-                rel = 0
-                if len(labs):
-                    vals, cnt = np.unique(labs, return_counts=True)
-                    pre = f"{vals[cnt.argmax()]:.0f}"
-                    rel = int(str(int(vals[cnt.argmax()])) in reliable)
-                f.write(f"{sid},{areas[k]},{int(m.sum())},{pre},{rel}\n")
+                mo = int(modal[sid])
+                pre = f"{mo:.0f}" if mo > 0 else ""
+                rel = int(mo > 0 and str(mo) in reliable)
+                f.write(f"{sid},{areas[k]},{int(n_mols_arr[sid])},{pre},{rel}\n")
         log(f"种子 QC 写出: {p_seedqc}")
 
     # ---------- Step 2: 扩散估计 + 逐细胞参数 ----------

@@ -10,6 +10,33 @@ from scipy import ndimage as ndi
 from skimage import filters, measure, segmentation, feature, morphology
 
 
+def _remove_small(arr, min_size):
+    """morphology.remove_small_objects 的替代实现。
+
+    skimage 0.26 起 min_size 参数弃用 (FutureWarning), 且 label 图只有 1 个
+    对象时会触发 "Only one label was provided" UserWarning。本实现:
+    bool 图 → 删除面积 < min_size 的连通域; int label 图 → 小对象像素置 0,
+    保留其余对象的原始编号。
+    """
+    if arr.dtype == bool:
+        lab = measure.label(arr)
+    else:
+        lab = arr
+    if lab.max() == 0:
+        return arr
+    sizes = np.bincount(lab.ravel())
+    small = np.flatnonzero(sizes < min_size)
+    small = small[small > 0]
+    if len(small) == 0:
+        return arr
+    out = arr.copy()
+    if arr.dtype == bool:
+        out[np.isin(lab, small)] = False
+    else:
+        out[np.isin(lab, small)] = 0
+    return out
+
+
 def _tiles(shape, tile, overlap):
     H, W = shape
     for y0 in range(0, H, tile - overlap):
@@ -57,7 +84,7 @@ def segment_nuclei(img, backend="skimage", tile=4096, overlap=128,
         else:
             blur = ndi.gaussian_filter(sub, 1.0)
             fg = blur > thr
-            fg = morphology.remove_small_objects(fg, 20)
+            fg = _remove_small(fg, 20)
             fg = ndi.binary_fill_holes(fg)
             if dense:
                 pk = feature.peak_local_max(
@@ -74,7 +101,7 @@ def segment_nuclei(img, backend="skimage", tile=4096, overlap=128,
                 if len(pk):
                     seed[tuple(pk.T)] = True
                 m = segmentation.watershed(-dist, markers=measure.label(seed), mask=fg)
-            m = morphology.remove_small_objects(m.astype(np.int32), min_size)
+            m = _remove_small(m.astype(np.int32), min_size)
         if m.max() == 0:
             continue
         # 只保留块中心区域的结果, 消除分块边缘重复
