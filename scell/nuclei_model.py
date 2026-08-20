@@ -32,6 +32,9 @@ class NucleiParams:
     dense_cov: float = 0.35
     dense_mode: str = "auto"     # auto | peaks | dist
     tile: int = 4096
+    max_cov: float = 0.35        # 块内前景覆盖率护栏 (防空块噪声过割)
+    max_size: int = 1500         # 核面积上限 (聚集体剔除)
+    min_circ: float = 0.5        # 圆度下限 (允许少量多核聚集)
 
     def save(self, path):
         with open(path, "w") as f:
@@ -43,13 +46,17 @@ class NucleiParams:
             return NucleiParams(**json.load(f))
 
 
-def apply(img, p: NucleiParams, backend="skimage", device="cpu"):
+def apply(img, p: NucleiParams, backend="skimage", device="cpu",
+          roi_mask=None, excl_mask=None, reliable_xy=None, log=print):
     """按参数分割细胞核, 返回 int32 label mask。"""
     return seeds.segment_nuclei(
         img, backend=backend, tile=p.tile,
         nuc_radius=p.min_distance, min_size=p.min_size,
         device=device, thr_factor=p.thr_factor,
-        dense_cov=p.dense_cov, dense_mode=p.dense_mode)
+        dense_cov=p.dense_cov, dense_mode=p.dense_mode,
+        roi_mask=roi_mask, excl_mask=excl_mask,
+        max_cov=p.max_cov, max_size=p.max_size, min_circ=p.min_circ,
+        reliable_xy=reliable_xy, log=log)
 
 
 def reliable_geometry(expr, reliable_ids):

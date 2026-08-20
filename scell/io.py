@@ -32,18 +32,18 @@ def load_expression(path):
             header = fh.readline()
         sep = "\t" if "\t" in header else ","
         df = pd.read_csv(p, sep=sep, engine="c", compression="infer",
-                         dtype={"geneID": str}, keep_default_na=False)
+                         dtype={"geneID": str, "label": str},
+                         keep_default_na=False)
     # 容忍列顺序/多余空白: 按名称取列
     df.columns = [c.strip() for c in df.columns]
     genes, gene_codes = np.unique(df["geneID"].fillna("NA").map(str).values,
                                   return_inverse=True)
     lab_raw = df["label"].astype(str).str.strip()
     lab_str = lab_raw.values
-    tail = np.char.array(lab_str)
-    # 取最后一段(以 . 分隔)并转数字; 失败 → 0
-    tail = np.array([s.rsplit(".", 1)[-1] for s in lab_str])
+    # 取最后一段(以 . 分隔)并转数字; 失败 → 0 (向量化的 str 访问器, 避免逐行 Python 循环)
+    tail = lab_raw.str.rsplit(".", n=1).str[-1]
     with np.errstate(invalid="ignore"):
-        lab_num = pd.to_numeric(pd.Series(tail), errors="coerce").fillna(0).values
+        lab_num = pd.to_numeric(tail, errors="coerce").fillna(0).values
     return {
         "genes": genes,
         "gene_codes": gene_codes.astype(np.int32),
@@ -103,7 +103,7 @@ def write_updated_matrix(src_path, out_path, new_cell_id, compression="gzip",
     i, first, total = 0, True, 0
     # keep_default_na=False: 同上, "nan"/"null" 等是合法基因名, 必须原样保留
     for df in pd.read_csv(p, sep=sep, engine="c", compression="infer",
-                          chunksize=chunk, dtype={"geneID": str},
+                          chunksize=chunk, dtype={"geneID": str, "label": str},
                           keep_default_na=False):
         n = len(df)
         df = df.iloc[:, :-1].copy()
@@ -123,9 +123,11 @@ def save_cell_by_gene(out_prefix, cell_ids, genes, gene_codes, mid, assign, conf
     from scipy import sparse
     keep = assign > 0
     rows = assign[keep] - 1
+    # shape 用 len(cell_ids) 而非 assign.max(): 尾部无分子的种子也必须占位,
+    # 否则 obs_names 长度 > 矩阵行数, anndata 报 ValueError
     mat = sparse.csr_matrix(
         (mid[keep].astype(np.float32), (rows, gene_codes[keep])),
-        shape=(int(assign.max()), len(genes)),
+        shape=(len(cell_ids), len(genes)),
     )
     try:
         import anndata as ad

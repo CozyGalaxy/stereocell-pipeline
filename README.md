@@ -1,16 +1,19 @@
 # StereoCell 细胞分割流程（集群版）
 
 [![CI](https://github.com/CozyGalaxy/stereocell-pipeline/actions/workflows/ci.yml/badge.svg)](https://github.com/CozyGalaxy/stereocell-pipeline/actions/workflows/ci.yml)
-[![release](https://img.shields.io/github/v/release/CozyGalaxy/stereocell-pipeline)](https://github.com/CozyGalaxy/stereocell-pipeline/releases/tag/v1.0.0)
+[![release](https://img.shields.io/github/v/release/CozyGalaxy/stereocell-pipeline)](https://github.com/CozyGalaxy/stereocell-pipeline/releases)
 
 输入（均来自 StereoCell 技术）：
 1. **ssDNA 灰度图像**（核染色，鉴定细胞核位置）
 2. **逐像素表达矩阵**：`geneID, x, y, MIDCount, ExonCount, label`（首行为 title；`label=0/0.0` 表示无细胞；其余为预分配细胞 ID——纯数字或带前缀字符串如 `Sample.chip.2803`，**不准确**，需用 ssDNA 校准）
 3. **可靠细胞列表**：经下游验证的少量准确细胞 ID（作为锚点；可与 label 同格式）
 
-流程由**两个可独立运行的模块**组成，均支持"训练参数模式"与"无督导模式"：
+流程由**两个可独立运行的模块**组成（核识别/细胞分割前置 Step0 芯片区域识别），均支持"训练参数模式"与"无督导模式"：
 
 ```
+Step0  (芯片区域):  表达密度直方图 Otsu → 芯片主体 ROI; 局部背景扣除 → 伪影排除
+                        │ (片外黑/白背景、亮边框、严重聚集、刮擦线均不入分析)
+                        ▼
 模块一 (核识别):  nuclei_train.py → params_nuclei.json → nuclei_segment.py
                         │ (训练: 多组 ssDNA+矩阵+可靠细胞, 网格搜索)
                         ▼
@@ -19,6 +22,21 @@
                         ▼
         细胞 mask / 像素映射 / 更新矩阵 / QC / 合胞体概率 / h5ad
 ```
+
+## Step0：芯片区域识别与伪影排除（v1.2.0 新增）
+
+芯片测序区域约占 ssDNA 图 70–80%，片外可能为黑色背景、白色（过曝）背景或高亮芯片边缘；另有细胞严重聚集形成的不规则高亮团块/长线及刮擦痕迹。Step0 在分割前自动圈定合法区域：
+
+- **ROI 判定**：对表达矩阵做流式 MIDCount 直方图（bin 默认 48 px），log 密度 Otsu 阈值 → 闭运算 + 填洞 + 最大连通域 → 主体芯片区域；对黑/白片外背景均稳健（只依赖表达密度，不依赖图像亮度）。默认再内缩 96 px（`--roi-erode`）去除边缘沉积带。
+- **伪影排除**：ssDNA 图局部背景扣除后按稳健高亮阈值（中位数 + z·MAD，`--excl-z`）检出异常亮结构；面积过大（>max_size 的 4 倍）或狭长（偏心率>0.985 且面积达标）判为聚集团块/刮擦线；前景覆盖率 >0.55 的窗口判定严重聚集整窗排除。允许少量正常多核聚集（小面积高亮不过滤）。
+- **形态 QC 护栏**：核分割后按面积 [30, max_size]、圆度 ≥ min_circ、峰值强度过滤，剔除残余不规则亮斑。
+- 可用 `--no-roi` / `--no-excl` 分别关闭。
+
+输出（`run_pipeline.py` / `nuclei_segment.py --matrix` 时）：
+- `00_roi_masks.npz` — ROI / 伪影掩膜缓存（原子写入，可断点续跑）
+- `00_roi_overlay.png` — ssDNA 图 + ROI 边界（绿） + 排除区轮廓（蓝）
+
+**每芯片参数自适应**：若提供可靠细胞列表，核峰值阈值在全分辨率归一化图上按可靠细胞质心邻域峰值 p20 自动校准（低密度/低曝光芯片自动降低阈值，高密度芯片提高阈值防过割）。
 
 ## 模块一：ssDNA 细胞核识别
 
@@ -99,7 +117,7 @@ pip install torch --index-url https://download.pytorch.org/whl/cu121   # GPU 可
 pip install cellpose                                                    # GPU 分割后端可选
 ```
 
-## 安装（v1.0.0）
+## 安装（当前版本 v1.2.0）
 
 ```bash
 pip install .            # 或 pip install git+https://github.com/<user>/stereocell-pipeline.git
@@ -136,9 +154,13 @@ python cell_segment.py --ssdna pilot/crop_ssdna.tif --matrix pilot/crop_matrix.t
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
-| NucleiParams.thr_factor | 1.0 | Otsu 阈值倍率（训练学习） |
+| NucleiParams.thr_factor | 1.0 | 阈值倍率（训练学习；v1.2.0 起阈值为半正态噪声 σ 估计，非 Otsu） |
 | NucleiParams.min_distance | 6 | 相邻核最小间距 px（训练学习） |
-| NucleiParams.dense_cov | 0.35 | 前景覆盖率超过则启用致密回退（强度峰种子） |
+| NucleiParams.max_cov | 0.35 | 单块前景覆盖率护栏（v1.2.0） |
+| NucleiParams.max_size / min_circ | 1500 / 0.5 | 核面积上限 / 圆度下限，形态 QC（v1.2.0） |
+| --roi-bin / --roi-erode | 48 / 96 px | Step0 密度直方图 bin 宽 / ROI 内缩量 |
+| --excl-z | 6.0 | 伪影高亮阈值（中位数+z·MAD） |
+| --no-roi / --no-excl | 关 | 关闭 ROI 圈定 / 伪影排除 |
 | CellParams.kappa | 0.9 | R_i = min(r95, κ·d_i/2)；1.0 = 严格中线划分 |
 | CellParams.conf_thr | 0.55 | 分子归属最低后验（训练学习） |
 | CellParams.margin / dense_margin | 0.20 / 0.35 | top1−top2 最小后验差，拥挤区自动上调（训练学习） |
@@ -156,6 +178,23 @@ python cell_segment.py --ssdna pilot/crop_ssdna.tif --matrix pilot/crop_matrix.t
 | 细胞 QC | 189 通过 / 0 过滤 | 190 通过 / 0 过滤（mito max 2.9%） |
 | 合胞体候选对 (prob≥0.5) | 16 | 16 |
 
+## 大规模回归验证（v1.2.0, 16 张 StereoCell 芯片）
+
+| 芯片 | 问题 | v1.1.1 → v1.2.0 核数 | 结果 |
+|---|---|---|---|
+| F4 | 低密度被过割 19.8 万假核 | 198359 → 1773 | 校准 peak_thr=24.6，过割消除 |
+| H6 | 边缘高密度沉积 + 暗细胞漏检 | 1494 → 1565 | 沉积带排除 |
+| J7 | 低密度 + 暗细胞漏检 | 1672 → 5072 | 暗细胞恢复 |
+| M4 | 聚集高亮长线干扰 | 1232 → 2387 | 亮线蓝色排除 |
+| CD | 片外识别 4892 假核 | 15718 → 11942 | ROI 外假核全去除 |
+| H9 | 刮擦带误识别 | 11203 → 10768 | 刮擦带无检出 |
+| MA / G9 / F9 / J1 | 大量暗细胞漏检 | 2640→7627 / 3385→6074 / 1141→7265 / 598→5540 | 暗细胞大幅恢复 |
+| FA | 白色片外背景 | 3917 → 3844 | 白色带排除 |
+| CC / G2 | 好芯片回归 | 16503→16081 / 16769→16114 | 基本持平 |
+| A4 / C1 | C1 暗三角区漏检 | 13303→15509 / 15488→20621 | 暗三角区 598→1919（3.2×） |
+
+另修复：h5ad 写出时 obs_names 长度不一致崩溃（尾部无分子种子丢失所致）；`nan`/`null` 基因名被误读为空的 dtype 问题（label 列统一按 string 读取）。
+
 ## 目录结构
 
 ```
@@ -169,8 +208,9 @@ stereocell_pipeline/
 ├── run_pipeline.py      ← 传统单步入 口(兼容) + 冒烟测试
 ├── slurm_example.sh
 └── scell/
-    ├── io.py            ← 矩阵读写(label 兼容数字/前缀字符串)、h5ad/mtx 导出
-    ├── seeds.py         ← ssDNA 核分割 (分块; 致密回退; 连续重标号) + 红线叠加
+    ├── io.py            ← 矩阵读写(label 兼容数字/前缀字符串/nan基因名)、h5ad/mtx 导出
+    ├── roi.py           ← Step0: 芯片 ROI (密度直方图) + 伪影/聚集/刮擦排除
+    ├── seeds.py         ← ssDNA 核分割 (半正态阈值; 形态QC; ROI/排除掩膜) + 红线叠加
     ├── nuclei_model.py  ← 模块一参数模型/训练/锚定评分
     ├── diffusion.py     ← 密度、λ 估计(子采样+密度护栏)、R_i/margin_i
     ├── assign.py        ← 边际拒绝 GMM-EM (全向量化 numpy / torch GPU)

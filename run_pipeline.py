@@ -15,6 +15,7 @@ import time
 
 import numpy as np
 import tifffile
+from scipy import ndimage as ndi
 
 
 def log(msg):
@@ -39,6 +40,16 @@ def main():
     ap.add_argument("--min-nuc-mols", type=int, default=5)
     ap.add_argument("--em-iter", type=int, default=12)
     ap.add_argument("--chunk", type=int, default=2_000_000)
+    # ---- 芯片 ROI 与伪影排除 (Step0) ----
+    ap.add_argument("--no-roi", action="store_true", help="关闭芯片区域识别 (全图分析)")
+    ap.add_argument("--roi-bin", type=int, default=48, help="表达密度直方图 bin 像素")
+    ap.add_argument("--roi-erode", type=int, default=None,
+                    help="ROI 内缩像素 (默认 2*roi-bin, 去边框亮带)")
+    ap.add_argument("--no-excl", action="store_true", help="关闭伪影(聚集/刮擦)排除")
+    ap.add_argument("--excl-z", type=float, default=8.0, help="伪影亮度稳健 z 阈值")
+    ap.add_argument("--max-cov", type=float, default=0.35, help="块内前景覆盖率护栏")
+    ap.add_argument("--max-size", type=int, default=1500, help="细胞核面积上限(像素)")
+    ap.add_argument("--min-circ", type=float, default=0.5, help="细胞核圆度下限")
     ap.add_argument("--force", action="store_true")
     args = ap.parse_args()
 
@@ -52,7 +63,7 @@ def main():
         args.reliable = pre + "_reliable.txt"
         log("冒烟测试: 已生成合成三件套")
 
-    from scell import io as scio, seeds, diffusion, assign as scassign, export
+    from scell import io as scio, seeds, diffusion, assign as scassign, export, roi
 
     # ---------- 读入 ----------
     log("加载表达矩阵 ...")
@@ -60,12 +71,73 @@ def main():
     reliable = scio.load_reliable(args.reliable)
     log(f"分子行数={expr['n_rows']}, 基因数={len(expr['genes'])}, 可靠细胞数={len(reliable)}")
 
+    # 可靠细胞分子加权质心 (供每芯片参数校准: 峰值阈值/核半径)
+    rel_ids = scio.reliable_label_ids(reliable)
+    reliable_xy = None
+    if rel_ids:
+        sel = np.isin(expr["label"], list(rel_ids))
+        if sel.any():
+            labs = expr["label"][sel]
+            uniq, inv = np.unique(labs, return_inverse=True)
+            w = expr["mid"][sel].astype(np.float64)
+            cx = np.bincount(inv, weights=expr["x"][sel] * w) / np.bincount(inv, weights=w)
+            cy = np.bincount(inv, weights=expr["y"][sel] * w) / np.bincount(inv, weights=w)
+            reliable_xy = np.stack([cx, cy], 1)
+            if len(reliable_xy) > 5000:  # 校准采样上限
+                idx = np.random.default_rng(0).choice(len(reliable_xy), 5000, replace=False)
+                reliable_xy = reliable_xy[idx]
+            log(f"可靠细胞质心: {len(reliable_xy)} 个 (用于峰值阈值校准)")
+
+    p_roi = os.path.join(args.outdir, "00_roi_masks.npz")
     p_nucmask = os.path.join(args.outdir, "01_nuclei_mask.tif")
     p_seedqc = os.path.join(args.outdir, "02_seed_qc.csv")
     p_fit = os.path.join(args.outdir, "03_diffusion_fit.png")
     p_params = os.path.join(args.outdir, "04_cell_params.csv")
     p_assign = os.path.join(args.outdir, "05_assign.npz")
     p_cellmask = os.path.join(args.outdir, "06_cell_mask.tif")
+
+    # ---------- Step 0: 芯片 ROI + 伪影排除 ----------
+    roi_full = excl = None
+    if not args.no_roi:
+        if os.path.exists(p_roi) and not args.force:
+            z = np.load(p_roi)
+            roi_small, excl = z["roi_small"], z["excl"]
+            log("Step0 跳过: ROI/伪影掩膜已存在")
+        else:
+            log("Step0: 芯片区域识别 (表达密度) ...")
+            img0 = tifffile.imread(args.ssdna)
+            if img0.ndim > 2:
+                img0 = img0.squeeze()
+            hist = roi.density_histogram(args.matrix, img0.shape,
+                                         bin_size=args.roi_bin, chunk=args.chunk)
+            roi_small = roi.chip_roi(hist)
+            er = args.roi_erode if args.roi_erode is not None else roi.roi_erosion_px(args.roi_bin)
+            roi_small = roi.erode_roi_small(roi_small, er, args.roi_bin)
+            roi_full_tmp = roi.upsample_mask(roi_small, img0.shape, args.roi_bin)
+            log(f"  ROI 占全图 {roi_full_tmp.mean():.1%} (内缩 {er}px)")
+            if args.no_excl:
+                excl = np.zeros(img0.shape, bool)
+            else:
+                log("Step0: 伪影检测 (聚集体/刮擦/严重聚集) ...")
+                excl = roi.artifact_mask(img0, roi_full_tmp, nuc_radius=args.nuc_radius,
+                                         z_thr=args.excl_z)
+                log(f"  伪影排除区占 ROI {excl.sum() / max(roi_full_tmp.sum(), 1):.1%}")
+            np.savez_compressed(p_roi, roi_small=roi_small, excl=excl)
+            seeds.write_overlay(img0, (roi_full_tmp & ~excl).astype(np.int32),
+                                os.path.join(args.outdir, "00_roi_overlay.png"),
+                                excl_mask=excl)
+            roi_full = roi_full_tmp
+            del img0
+            log("Step0 完成: 00_roi_masks.npz / 00_roi_overlay 已输出")
+        if roi_full is None:
+            # 由缓存或上一步重建全分辨率 ROI (此处一定有 img 之外的形状信息)
+            if os.path.exists(p_nucmask) and not args.force:
+                _shape = tifffile.imread(p_nucmask).shape
+            else:
+                _img = tifffile.imread(args.ssdna)
+                _shape = _img.shape if _img.ndim == 2 else _img.squeeze().shape
+                del _img
+            roi_full = roi.upsample_mask(roi_small, _shape, args.roi_bin)
 
     # ---------- Step 1: 核分割 ----------
     if os.path.exists(p_nucmask) and not args.force:
@@ -74,10 +146,17 @@ def main():
     else:
         log(f"Step1: ssDNA 核分割 (backend={args.seed_backend}, device={args.device})")
         img = tifffile.imread(args.ssdna)
+        if img.ndim > 2:
+            img = img.squeeze()
         nuclei = seeds.segment_nuclei(img, backend=args.seed_backend, tile=args.tile,
-                                      nuc_radius=args.nuc_radius, device=args.device)
+                                      nuc_radius=args.nuc_radius, device=args.device,
+                                      roi_mask=roi_full, excl_mask=excl,
+                                      max_cov=args.max_cov, max_size=args.max_size,
+                                      min_circ=args.min_circ,
+                                      reliable_xy=reliable_xy, log=log)
         tifffile.imwrite(p_nucmask, nuclei.astype(np.int32))
-        seeds.write_overlay(img, nuclei, os.path.join(args.outdir, "seeds_overlay.png"))
+        seeds.write_overlay(img, nuclei, os.path.join(args.outdir, "seeds_overlay.png"),
+                            excl_mask=excl)
         log(f"Step1 完成: 检出核 {nuclei.max()} 个, seeds_overlay 已输出")
     nuclei = nuclei.astype(np.int32)
     ids, areas, cents = seeds.nuclei_stats(nuclei)
@@ -175,6 +254,8 @@ def main():
                      frac_isolated=float(isolated.mean()),
                      frac_mols_assigned=n_assigned / expr["n_rows"],
                      median_conf=float(np.median(conf[conf > 0])) if (conf > 0).any() else 0.0,
+                     roi_frac=float(roi_full.mean()) if roi_full is not None else 1.0,
+                     excl_frac_of_roi=float(excl.sum() / max(roi_full.sum(), 1)) if (excl is not None and roi_full is not None) else 0.0,
                      outputs={"updated_matrix": out_matrix, "cell_by_gene": made,
                               "cell_mask": p_cellmask})
     log(f"全部完成。输出目录: {args.outdir}")
