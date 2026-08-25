@@ -17,8 +17,10 @@ def chip_row(d):
     if os.path.isfile(qr):
         with open(qr) as f:
             r = json.load(f)
-        for k in ("n_nuclei", "n_cells", "n_molecules", "assigned_frac",
-                  "roi_frac", "excl_frac_of_roi", "lambda", "r95"):
+        for k in ("n_nuclei", "n_cells", "n_seeds", "n_genes", "n_reliable",
+                  "n_molecules", "assigned_frac", "frac_mols_assigned",
+                  "roi_frac", "excl_frac_of_roi", "lambda", "lambda_px",
+                  "r95", "r95_px", "D_ISO_px", "frac_isolated", "median_conf"):
             if k in r:
                 row[k] = r[k]
     qc = os.path.join(d, "cell_qc.csv")
