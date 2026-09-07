@@ -51,10 +51,19 @@ def main():
                     help="无督导模式下覆盖 kappa (1.0 = 严格中线划分)")
     ap.add_argument("--sample", default=None,
                     help="文库名: 输出矩阵/h5ad/5NN 中细胞命名为 sample.ID (非细胞=0)")
+    # ---- CellBender 输入 (伪空液滴) ----
+    ap.add_argument("--cellbender", action="store_true",
+                    help="输出 CellBender raw 输入 h5ad (真细胞+伪空液滴)")
+    ap.add_argument("--pseudo-size", type=int, default=0,
+                    help="伪细胞 bin 边长 px (0=自动: sqrt(细胞领地面积中位数))")
+    ap.add_argument("--pseudo-margin", type=int, default=5,
+                    help="细胞领地外扩 px, 该范围内不生成伪细胞")
+    ap.add_argument("--pseudo-max", type=int, default=50000, help="伪细胞数上限")
+    ap.add_argument("--pseudo-min-umi", type=int, default=1, help="伪细胞最少 UMI")
     args = ap.parse_args()
 
     from scell import io as scio, seeds, export
-    from scell import cell_model as cm, qc as scqc, syncytium
+    from scell import cell_model as cm, qc as scqc, syncytium, pseudo
 
     os.makedirs(args.outdir, exist_ok=True)
     if args.params:
@@ -170,6 +179,37 @@ def main():
                                out_tsv=knn_tsv, sample=args.sample)
     log(f"5NN 距离矩阵写出 {knn_npz} / {knn_tsv}")
 
+    # ---------- CellBender 输入: 真细胞(未过滤) + 伪空液滴 ----------
+    cb_h5ad = None
+    if args.cellbender:
+        log("Step7: CellBender 输入构建 (伪空液滴)")
+        from scipy import sparse as _sp
+        a_all = res["assign"]
+        keep_m = a_all > 0
+        real_mat = _sp.csr_matrix(
+            (expr["mid"][keep_m].astype(np.float32),
+             (a_all[keep_m] - 1, expr["gene_codes"][keep_m])),
+            shape=(len(ids), len(expr["genes"])))
+        pmat, pmeta = pseudo.build_pseudo_cells(
+            res["cell_mask"], expr["x"], expr["y"], expr["mid"],
+            expr["gene_codes"], len(expr["genes"]),
+            size=args.pseudo_size, margin=args.pseudo_margin,
+            max_cells=args.pseudo_max, min_umi=args.pseudo_min_umi, log=log)
+        real_names = [f"{args.sample}.{int(c)}" if args.sample else str(int(c))
+                      for c in ids]
+        cb_h5ad = os.path.join(args.outdir, "cellbender_raw.h5ad")
+        pseudo.write_cellbender_input(cb_h5ad, real_mat, real_names,
+                                      expr["genes"], pmat, args.sample)
+        # 伪细胞坐标表
+        with open(os.path.join(args.outdir, "pseudo_cells.csv"), "w") as f:
+            f.write("pseudo_id,cx,cy,n_umi,bin_size\n")
+            for k in range(len(pmeta["n_umi"])):
+                nm = f"{args.sample}.pseudo{k+1}" if args.sample else f"pseudo{k+1}"
+                f.write(f"{nm},{pmeta['bin_x'][k]},{pmeta['bin_y'][k]},"
+                        f"{pmeta['n_umi'][k]:.0f},{pmeta['bin_size']}\n")
+        log(f"CellBender 输入: {cb_h5ad} ({len(ids)} 真细胞 + "
+            f"{len(pmeta['n_umi'])} 伪空液滴)")
+
     export.qc_report(os.path.join(args.outdir, "qc_report.json"),
                      mode="trained" if args.params else "unsupervised",
                      n_molecules=expr["n_rows"], n_genes=len(expr["genes"]),
@@ -184,6 +224,7 @@ def main():
                      n_syncytium_pairs=len(pairs), n_syncytium_high=n_high,
                      n_nuclei_flagged=int((flags != "ok").sum()),
                      sample=args.sample,
+                     cellbender_raw=cb_h5ad,
                      outputs={"matrix": out_matrix, "cell_by_gene": made,
                               "nucleus_morphology": os.path.join(args.outdir, "02_nucleus_morphology.csv"),
                               "knn5_npz": knn_npz, "knn5_tsv": knn_tsv})

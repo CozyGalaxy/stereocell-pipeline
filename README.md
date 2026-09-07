@@ -117,7 +117,7 @@ pip install torch --index-url https://download.pytorch.org/whl/cu121   # GPU 可
 pip install cellpose                                                    # GPU 分割后端可选
 ```
 
-## 安装（当前版本 v1.3.0）
+## 安装（当前版本 v1.4.0）
 
 ```bash
 pip install .            # 或 pip install git+https://github.com/<user>/stereocell-pipeline.git
@@ -133,6 +133,24 @@ stereocell-nuclei-segment  --ssdna ssDNA.tif --outdir out_nuclei/
 stereocell-cell-train      --manifest train.tsv --out params_cell.json
 stereocell-cell-segment    --ssdna ssDNA.tif --matrix matrix.txt --outdir out_cells/
 stereocell-run             --smoke-test --outdir /tmp/scell_smoke
+```
+
+## v1.4.0 新增：CellBender 环境 RNA 去除输入
+
+`cell_segment.py --cellbender` 输出 `cellbender_raw.h5ad`（真细胞 + 伪空液滴），供 CellBender remove-background 估计并扣除 ambient RNA：
+
+- **伪空液滴策略**（对照 CellBender"空液滴与真液滴捕获面积/效率一致"假设设计）：
+  1. 尺寸自动匹配真实细胞领地面积中位数（边长 = √area_med，通常 55–70px；可用 `--pseudo-size 25` 固定为 25×25）；
+  2. 只排除与细胞领地（外扩 `--pseudo-margin` px，默认 5）重叠的 bin——**扩散晕(halo)内的 bin 保留**，因为扩散 RNA 正是污染细胞的 ambient 来源，远离细胞的区域反而低估真实污染；
+  3. 候选超过 `--pseudo-max`（默认 50000）时随机子采样（固定 seed 可复现）；
+- obs 标注 `droplet_type`（cell/empty）与 `is_pseudo`；伪细胞命名 `sample.pseudoK`；
+- 附 `pseudo_cells.csv`（伪细胞坐标/UMI/bin 尺寸）；anndata 缺失时降级 `cellbender_raw.npz` + barcodes/droplet_type/features tsv。
+
+CellBender 参考命令：
+
+```bash
+cellbender remove-background --input cellbender_raw.h5ad --output cb_clean.h5ad \
+    --expected-cells <真细胞数> --total-droplets-included <真细胞数+伪细胞数> --cuda
 ```
 
 ## v1.3.0 新增：迭代适配与核质量评估
