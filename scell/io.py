@@ -36,6 +36,9 @@ def load_expression(path):
                          keep_default_na=False)
     # 容忍列顺序/多余空白: 按名称取列
     df.columns = [c.strip() for c in df.columns]
+    # 迭代兼容: 上一轮流程输出的矩阵末列名为 cell_id, 统一视为 label
+    if "label" not in df.columns and "cell_id" in df.columns:
+        df = df.rename(columns={"cell_id": "label"})
     genes, gene_codes = np.unique(df["geneID"].fillna("NA").map(str).values,
                                   return_inverse=True)
     lab_raw = df["label"].astype(str).str.strip()
@@ -80,14 +83,15 @@ def reliable_label_ids(reliable):
 
 
 def write_updated_matrix(src_path, out_path, new_cell_id, compression="gzip",
-                         chunk=5_000_000):
+                         chunk=5_000_000, sample=None):
     """按原始行序把 label 列替换为 new_cell_id, 分块写出(内存安全)。
     new_cell_id: int32 数组, 长度 = 矩阵行数, 0 = 背景/拒收。
+    sample: 文库名; 给定后真实细胞写作 "sample.ID", 非细胞仍为 "0"。
     """
     p = str(src_path)
     if p.endswith(".parquet"):
         df = pd.read_parquet(p)
-        df["label"] = new_cell_id
+        df["label"] = _format_ids(new_cell_id, sample)
         df.rename(columns={"label": "cell_id"}).to_parquet(out_path, index=False)
         return
     with _open(p) as fh:
@@ -107,7 +111,7 @@ def write_updated_matrix(src_path, out_path, new_cell_id, compression="gzip",
                           keep_default_na=False):
         n = len(df)
         df = df.iloc[:, :-1].copy()
-        df["cell_id"] = new_cell_id[i:i + n]
+        df["cell_id"] = _format_ids(new_cell_id[i:i + n], sample)
         df.to_csv(fout, sep=sep, index=False, header=first, columns=out_cols)
         first = False
         i += n
@@ -116,9 +120,22 @@ def write_updated_matrix(src_path, out_path, new_cell_id, compression="gzip",
     assert total == len(new_cell_id), f"行数不匹配: 写入了{total}, 赋值数组{len(new_cell_id)}"
 
 
-def save_cell_by_gene(out_prefix, cell_ids, genes, gene_codes, mid, assign, conf=None):
+def _format_ids(ids, sample):
+    """细胞 ID 输出格式化: sample 给定时 >0 的 ID 写作 "sample.ID", 0 保持 "0"。
+    未给 sample 时原样返回整数数组。unique+LUT 向量化, 亿级行安全。"""
+    if sample is None:
+        return ids
+    ids = np.asarray(ids)
+    uniq, inv = np.unique(ids, return_inverse=True)
+    lut = np.where(uniq > 0, np.char.add(f"{sample}.", uniq.astype(str)), "0")
+    return lut[inv]
+
+
+def save_cell_by_gene(out_prefix, cell_ids, genes, gene_codes, mid, assign, conf=None,
+                      sample=None):
     """聚合 cell×gene 稀疏矩阵。优先 .h5ad, 降级 .mtx。
     cell_ids: 输出细胞 ID 序列(int, 从1开始按 assign 值); assign: 每分子细胞索引(0=背景)。
+    sample: 文库名; 给定后 obs/barcodes 命名为 "sample.ID"。
     """
     from scipy import sparse
     keep = assign > 0
@@ -129,10 +146,11 @@ def save_cell_by_gene(out_prefix, cell_ids, genes, gene_codes, mid, assign, conf
         (mid[keep].astype(np.float32), (rows, gene_codes[keep])),
         shape=(len(cell_ids), len(genes)),
     )
+    names = [f"{sample}.{c}" if sample else str(c) for c in cell_ids]
     try:
         import anndata as ad
         adata = ad.AnnData(X=mat)
-        adata.obs_names = [str(c) for c in cell_ids]
+        adata.obs_names = names
         adata.var_names = list(genes)
         if conf is not None:
             adata.obs["mean_conf"] = np.bincount(rows, weights=conf[keep],
@@ -144,7 +162,7 @@ def save_cell_by_gene(out_prefix, cell_ids, genes, gene_codes, mid, assign, conf
         from scipy import io as sio
         sio.mmwrite(out_prefix + ".mtx", mat)
         with open(out_prefix + "_barcodes.tsv", "w") as f:
-            f.write("\n".join(str(c) for c in cell_ids) + "\n")
+            f.write("\n".join(names) + "\n")
         with open(out_prefix + "_features.tsv", "w") as f:
             f.write("\n".join(genes) + "\n")
         return out_prefix + ".mtx"

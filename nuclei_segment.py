@@ -106,15 +106,23 @@ def main():
             sl = slice(k, k + 1_000_000)
             f.write("".join(f"{xs[i]}\t{ys[i]}\t{mask[ys[i], xs[i]]}\n"
                             for i in range(sl.start, min(sl.stop, len(ys)))))
-    # 汇总
-    with open(os.path.join(args.outdir, "nuclei_summary.csv"), "w") as f:
-        f.write("nucleus_id,cx,cy,area_px,mean_intensity\n")
-        for k, sid in enumerate(ids):
-            m = mask == sid
-            f.write(f"{sid},{cents[k][0]:.1f},{cents[k][1]:.1f},{areas[k]},"
-                    f"{img[m].mean():.1f}\n")
+    # 汇总 + 核一致性质量评估 (同物种核大小应均一、近似椭圆)
+    morph = seeds.nucleus_morphology(mask, img)
+    flags, (alo, ahi) = seeds.classify_nuclei(morph)
+    morph["morph_flag"] = flags
+    out = morph.rename(columns={"label": "nucleus_id", "area": "area_px"})
+    cols = ["nucleus_id", "cx", "cy", "area_px", "circularity", "eccentricity",
+            "solidity", "major_axis", "minor_axis", "mean_intensity",
+            "max_intensity", "morph_flag"]
+    out[[c for c in cols if c in out.columns]].to_csv(
+        os.path.join(args.outdir, "nuclei_summary.csv"), index=False)
+    log(f"核形态 QC: 合法面积 {alo:.0f}-{ahi:.0f}px, 异常 {int((flags != 'ok').sum())}/{len(flags)} ("
+        + ", ".join(f"{t}={int((flags == t).sum())}" for t in sorted(set(flags)) if t != "ok")
+        + ")")
+    colors = {int(l): seeds.MORPH_FLAG_COLORS[f]
+              for l, f in zip(morph["label"].values, flags) if f != "ok"}
     seeds.write_overlay(img, mask, os.path.join(args.outdir, "nuclei_overlay.png"),
-                        excl_mask=excl_mask)
+                        excl_mask=excl_mask, label_colors=colors)
     p.save(os.path.join(args.outdir, "params_used.json"))
     log(f"完成。输出: {args.outdir}")
 

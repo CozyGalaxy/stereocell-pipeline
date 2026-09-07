@@ -242,8 +242,69 @@ def nuclei_stats(mask, min_radius_px=1.0):
     return ids, areas, cents
 
 
-def write_overlay(img, label_mask, out_path, max_png_px=16000, excl_mask=None):
-    """ssDNA 灰度图 + 1 像素红色实例轮廓 (+ 伪影排除区蓝色轮廓)。大图自动写 TIFF。"""
+# ---- 核一致性质量评估 (同物种核大小应均一、近似椭圆) ----
+
+MORPH_FLAG_COLORS = {
+    "ok":            (1.00, 0.00, 0.00),  # 红:   正常核
+    "big_irregular": (1.00, 1.00, 0.00),  # 黄:   过大且不规则 (多核聚集/刮擦嫌疑)
+    "big_round":     (1.00, 0.55, 0.00),  # 橙:   过大但近圆 (双核紧贴/合胞体嫌疑)
+    "elongated":     (1.00, 0.00, 1.00),  # 品红: 拉长 (刮擦残余/聚集拉伸)
+    "tiny_round":    (0.00, 1.00, 0.00),  # 绿:   过小且完全规则 (染色碎屑/扩散伪点)
+    "tiny":          (0.00, 1.00, 1.00),  # 青:   过小碎片
+}
+
+
+def nucleus_morphology(mask, img=None):
+    """逐核形态学指标, 返回 pandas DataFrame:
+    label, cx, cy, area, perimeter, circularity, eccentricity, solidity,
+    major_axis, minor_axis [, mean_intensity, max_intensity]。
+    """
+    import pandas as pd
+    props = ("label", "area", "perimeter", "eccentricity", "solidity",
+             "major_axis_length", "minor_axis_length", "centroid")
+    if img is not None:
+        tbl = measure.regionprops_table(
+            mask, intensity_image=img.astype(np.float32),
+            properties=props + ("mean_intensity", "max_intensity"))
+    else:
+        tbl = measure.regionprops_table(mask, properties=props)
+    df = pd.DataFrame(tbl)
+    df["circularity"] = 4 * np.pi * df["area"] / np.maximum(df["perimeter"] ** 2, 1)
+    df = df.rename(columns={"centroid-0": "cy", "centroid-1": "cx",
+                            "major_axis_length": "major_axis",
+                            "minor_axis_length": "minor_axis"})
+    return df
+
+
+def classify_nuclei(df, z=6.0, min_area_floor=30, elong_ecc=0.90,
+                    round_circ=0.95, irreg_circ=0.75):
+    """按形态一致性把核分类。以全芯片面积中位数 ± z·MAD 为合法区间
+    (同一物种核大小应均一; z=6 允许正常多核细胞的少量偏大)。
+    返回 (flags: np.array[str], bounds: (lo, hi))。优先级:
+    big_irregular > big_round > elongated > tiny_round > tiny > ok。
+    """
+    med = float(df["area"].median())
+    mad = float((df["area"] - med).abs().median()) * 1.4826 or 1.0
+    lo = max(med - z * mad, min_area_floor)
+    hi = med + z * mad
+    flags = np.full(len(df), "ok", dtype=object)
+    big = df["area"].values > hi
+    small = df["area"].values < lo
+    circ = df["circularity"].values
+    ecc = df["eccentricity"].values
+    flags[small] = "tiny"
+    flags[small & (circ > round_circ)] = "tiny_round"
+    flags[(~big) & (ecc > elong_ecc)] = "elongated"
+    flags[big] = "big_round"
+    flags[big & (circ < irreg_circ)] = "big_irregular"
+    return flags, (lo, hi)
+
+
+def write_overlay(img, label_mask, out_path, max_png_px=16000, excl_mask=None,
+                  label_colors=None):
+    """ssDNA 灰度图 + 1 像素实例轮廓。大图自动写 TIFF。
+    excl_mask: 伪影排除区 (蓝色轮廓); label_colors: {label: (r,g,b)} 逐实例分色
+    (配合 classify_nuclei / MORPH_FLAG_COLORS 按核质量分色), 缺省全红。"""
     from skimage.segmentation import find_boundaries
     gray = img.astype(np.float32)
     gray = (gray - gray.min()) / max(float(np.ptp(gray)), 1e-6)
@@ -254,7 +315,15 @@ def write_overlay(img, label_mask, out_path, max_png_px=16000, excl_mask=None):
     bd = find_boundaries(label_mask, mode="outer") & (label_mask >= 0)
     # 实例间边界也要画出: 对 label 图求 boundaries
     bd |= find_boundaries(label_mask, mode="thick") & (label_mask > 0)
-    rgb[bd] = [1.0, 0.0, 0.0]
+    if label_colors is None:
+        rgb[bd] = [1.0, 0.0, 0.0]
+    else:
+        n = int(label_mask.max())
+        lut = np.tile(np.array([1.0, 0.0, 0.0], np.float32), (n + 1, 1))
+        for lab, col in label_colors.items():
+            if 0 < lab <= n:
+                lut[int(lab)] = col
+        rgb[bd] = lut[label_mask[bd]]
     rgb8 = (rgb * 255).astype(np.uint8)
     if max(img.shape) > max_png_px or not out_path.endswith(".png"):
         tifffile.imwrite(out_path if out_path.endswith((".tif", ".tiff")) else out_path + ".tif", rgb8)

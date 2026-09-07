@@ -49,6 +49,8 @@ def main():
     ap.add_argument("--seed-backend", default="skimage", choices=["skimage", "cellpose"])
     ap.add_argument("--kappa", type=float, default=None,
                     help="无督导模式下覆盖 kappa (1.0 = 严格中线划分)")
+    ap.add_argument("--sample", default=None,
+                    help="文库名: 输出矩阵/h5ad/5NN 中细胞命名为 sample.ID (非细胞=0)")
     args = ap.parse_args()
 
     from scell import io as scio, seeds, export
@@ -86,9 +88,21 @@ def main():
     # 中间产物
     tifffile.imwrite(os.path.join(args.outdir, "01_nuclei_mask.tif"),
                      res["nuclei"].astype(np.int32))
-    seeds.write_overlay(img, res["nuclei"], os.path.join(args.outdir, "seeds_overlay.png"))
+    # 核一致性质量评估: 同物种核大小应均一、近似椭圆; 异常核分色标注
+    morph = seeds.nucleus_morphology(res["nuclei"].astype(np.int32), img)
+    flags, (alo, ahi) = seeds.classify_nuclei(morph)
+    morph["morph_flag"] = flags
+    morph.to_csv(os.path.join(args.outdir, "02_nucleus_morphology.csv"), index=False)
+    log(f"核形态 QC: 合法面积 {alo:.0f}-{ahi:.0f}px, 异常 {int((flags != 'ok').sum())}/{len(flags)} ("
+        + ", ".join(f"{t}={int((flags == t).sum())}" for t in sorted(set(flags)) if t != "ok")
+        + ")")
+    colors = {int(l): seeds.MORPH_FLAG_COLORS[f]
+              for l, f in zip(morph["label"].values, flags) if f != "ok"}
+    seeds.write_overlay(img, res["nuclei"], os.path.join(args.outdir, "seeds_overlay.png"),
+                        label_colors=colors)
     tifffile.imwrite(os.path.join(args.outdir, "cell_mask.tif"), res["cell_mask"])
-    seeds.write_overlay(img, res["cell_mask"], os.path.join(args.outdir, "cells_overlay.png"))
+    seeds.write_overlay(img, res["cell_mask"], os.path.join(args.outdir, "cells_overlay.png"),
+                        label_colors=colors)
     with open(os.path.join(args.outdir, "04_cell_params.csv"), "w") as f:
         f.write("seed_id,x,y,d_nn,R_i,margin_i,crowded\n")
         for k, sid in enumerate(ids):
@@ -128,7 +142,7 @@ def main():
                             for i in range(k, e)))
     # 文本1b: 更新矩阵
     out_matrix = os.path.join(args.outdir, "matrix_cell_id.txt.gz")
-    scio.write_updated_matrix(args.matrix, out_matrix, assign_f)
+    scio.write_updated_matrix(args.matrix, out_matrix, assign_f, sample=args.sample)
 
     # 文本2: 多核细胞概率
     log("Step6: 多核细胞(合胞体)概率评估")
@@ -147,7 +161,14 @@ def main():
         expr["gene_codes"][assign_f > 0],
         expr["mid"][assign_f > 0],
         _reindex(assign_f, pass_mask)[assign_f > 0],
-        res["conf"][assign_f > 0])
+        res["conf"][assign_f > 0], sample=args.sample)
+
+    # ---------- 5NN 距离稀疏矩阵 ----------
+    knn_npz = os.path.join(args.outdir, "cell_5nn_dist.npz")
+    knn_tsv = os.path.join(args.outdir, "cell_5nn_dist.tsv.gz")
+    export.knn_distance_matrix(cents, ids, k=5, out_npz=knn_npz,
+                               out_tsv=knn_tsv, sample=args.sample)
+    log(f"5NN 距离矩阵写出 {knn_npz} / {knn_tsv}")
 
     export.qc_report(os.path.join(args.outdir, "qc_report.json"),
                      mode="trained" if args.params else "unsupervised",
@@ -161,7 +182,11 @@ def main():
                      n_cells_filtered=int((~pass_mask).sum()),
                      mito_max=p.mito_max,
                      n_syncytium_pairs=len(pairs), n_syncytium_high=n_high,
-                     outputs={"matrix": out_matrix, "cell_by_gene": made})
+                     n_nuclei_flagged=int((flags != "ok").sum()),
+                     sample=args.sample,
+                     outputs={"matrix": out_matrix, "cell_by_gene": made,
+                              "nucleus_morphology": os.path.join(args.outdir, "02_nucleus_morphology.csv"),
+                              "knn5_npz": knn_npz, "knn5_tsv": knn_tsv})
     log(f"全部完成。输出目录: {args.outdir}")
 
 

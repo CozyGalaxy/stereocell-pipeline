@@ -117,7 +117,7 @@ pip install torch --index-url https://download.pytorch.org/whl/cu121   # GPU 可
 pip install cellpose                                                    # GPU 分割后端可选
 ```
 
-## 安装（当前版本 v1.2.0）
+## 安装（当前版本 v1.3.0）
 
 ```bash
 pip install .            # 或 pip install git+https://github.com/<user>/stereocell-pipeline.git
@@ -134,6 +134,21 @@ stereocell-cell-train      --manifest train.tsv --out params_cell.json
 stereocell-cell-segment    --ssdna ssDNA.tif --matrix matrix.txt --outdir out_cells/
 stereocell-run             --smoke-test --outdir /tmp/scell_smoke
 ```
+
+## v1.3.0 新增：迭代适配与核质量评估
+
+**迭代工作流（stereocell-run 初筛 → 四步精修）**：
+- `read_matrix` 直接兼容上一轮输出矩阵（末列 `cell_id` 自动视为 `label`；`sample.ID` 字符串 label 取末段数字映射）——tier0 的 `matrix_updated.csv.gz` 无需改列名即可作为 tier1 训练/推理输入；
+- 新增 `--sample` 参数：输出矩阵 / h5ad / 5NN 文件中真实细胞命名为 `sample.ID`，非细胞仍为 `0`（`run_pipeline.py` 与 `cell_segment.py` 均支持）。
+
+**核一致性质量评估**（同物种核大小应均一、近似椭圆）：
+- 新增输出 `02_nucleus_morphology.csv`：逐核面积/圆度/偏心率/长短轴/强度 + `morph_flag` 分类；
+- 分类以全芯片面积中位数 ± 6·MAD 为合法区间，异常类别：`big_irregular`（过大不规则，多核聚集/刮擦嫌疑）、`big_round`（过大近圆，双核紧贴嫌疑）、`elongated`（拉长）、`tiny_round`（过小且完全规则，染色碎屑/伪点嫌疑）、`tiny`（碎片）；
+- `nuclei_overlay` / `seeds_overlay` / `cells_overlay` 按核质量**分色**：正常=红，big_irregular=黄，big_round=橙，elongated=品红，tiny_round=绿，tiny=青（伪影排除区仍为蓝色）；
+- `nuclei_segment.py` 的 `nuclei_summary.csv` 同步扩展形态列（regionprops 一次计算，替代原逐核循环，更快）。
+
+**5NN 距离稀疏矩阵**：
+- 新增输出 `cell_5nn_dist.npz`（CSR 对称稀疏矩阵，data=欧氏距离 px）+ `cell_5nn_dist_ids.txt`（行/列对应的细胞名）+ `cell_5nn_dist.tsv.gz`（长表 cell_id / neighbor_id / dist_px，上三角去重），供聚集/污染排查。
 
 ## 集群运行
 

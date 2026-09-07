@@ -14,6 +14,7 @@ import os
 import time
 
 import numpy as np
+import pandas as pd
 import tifffile
 from scipy import ndimage as ndi
 
@@ -50,6 +51,8 @@ def main():
     ap.add_argument("--max-cov", type=float, default=0.35, help="块内前景覆盖率护栏")
     ap.add_argument("--max-size", type=int, default=1500, help="细胞核面积上限(像素)")
     ap.add_argument("--min-circ", type=float, default=0.5, help="细胞核圆度下限")
+    ap.add_argument("--sample", default=None,
+                    help="文库名: 输出矩阵/h5ad/5NN 中细胞命名为 sample.ID (非细胞=0)")
     ap.add_argument("--force", action="store_true")
     args = ap.parse_args()
 
@@ -155,12 +158,37 @@ def main():
                                       min_circ=args.min_circ,
                                       reliable_xy=reliable_xy, log=log)
         tifffile.imwrite(p_nucmask, nuclei.astype(np.int32))
-        seeds.write_overlay(img, nuclei, os.path.join(args.outdir, "seeds_overlay.png"),
-                            excl_mask=excl)
-        log(f"Step1 完成: 检出核 {nuclei.max()} 个, seeds_overlay 已输出")
+        log(f"Step1 完成: 检出核 {nuclei.max()} 个")
     nuclei = nuclei.astype(np.int32)
     ids, areas, cents = seeds.nuclei_stats(nuclei)
     r_nuc_med = float(np.median(np.sqrt(areas / np.pi)))
+
+    # ---- 核一致性质量评估 (Step1b): 同物种核大小应均一、近似椭圆 ----
+    p_nucqc = os.path.join(args.outdir, "02_nucleus_morphology.csv")
+    if os.path.exists(p_nucqc) and not args.force:
+        morph = pd.read_csv(p_nucqc)
+        flags = morph["morph_flag"].values
+        log("Step1b 跳过: 核形态 QC 已存在")
+    else:
+        img = tifffile.imread(args.ssdna)
+        if img.ndim > 2:
+            img = img.squeeze()
+        morph = seeds.nucleus_morphology(nuclei, img)
+        flags, (alo, ahi) = seeds.classify_nuclei(morph)
+        morph["morph_flag"] = flags
+        morph.to_csv(p_nucqc, index=False)
+        n_bad = int((flags != "ok").sum())
+        log(f"Step1b: 核形态 QC 写出 {p_nucqc} (合法面积 {alo:.0f}-{ahi:.0f}px, "
+            f"异常 {n_bad}/{len(flags)}: " +
+            ", ".join(f"{t}={int((flags == t).sum())}" for t in sorted(set(flags)) if t != "ok")
+            + ")")
+        # 分色 overlay: 正常红 / 聚集黄 / 双核橙 / 拉长品红 / 规则小点绿 / 碎片青
+        lab2flag = dict(zip(morph["label"].values, flags))
+        colors = {int(l): seeds.MORPH_FLAG_COLORS[f] for l, f in lab2flag.items()
+                  if f != "ok"}
+        seeds.write_overlay(img, nuclei, os.path.join(args.outdir, "seeds_overlay.png"),
+                            excl_mask=excl, label_colors=colors)
+        log("seeds_overlay 已输出 (按核质量分色)")
 
     # 种子 QC: 核内分子数 / 匹配预分配 label / 是否可靠
     ix = np.clip(expr["x"], 0, nuclei.shape[1] - 1)
@@ -238,14 +266,26 @@ def main():
     cell_mask = export.rasterize_cells(umi, nuclei, cents, R_i)
     tifffile.imwrite(p_cellmask, cell_mask)
     img = tifffile.imread(args.ssdna)
-    seeds.write_overlay(img, cell_mask, os.path.join(args.outdir, "cells_overlay.png"))
+    # 细胞 overlay 沿用核形态分色 (细胞 ID == 核 ID)
+    colors = {int(l): seeds.MORPH_FLAG_COLORS[f]
+              for l, f in zip(morph["label"].values, flags) if f != "ok"}
+    seeds.write_overlay(img, cell_mask, os.path.join(args.outdir, "cells_overlay.png"),
+                        label_colors=colors)
 
     out_matrix = os.path.join(args.outdir, "matrix_updated.csv.gz")
-    scio.write_updated_matrix(args.matrix, out_matrix, assign)
+    scio.write_updated_matrix(args.matrix, out_matrix, assign, sample=args.sample)
     cell_ids = ids
     prefix = os.path.join(args.outdir, "cells_x_genes")
     made = scio.save_cell_by_gene(prefix, cell_ids, expr["genes"],
-                                  expr["gene_codes"], expr["mid"], assign, conf)
+                                  expr["gene_codes"], expr["mid"], assign, conf,
+                                  sample=args.sample)
+
+    # ---------- Step 5: 5NN 距离稀疏矩阵 ----------
+    knn_npz = os.path.join(args.outdir, "cell_5nn_dist.npz")
+    knn_tsv = os.path.join(args.outdir, "cell_5nn_dist.tsv.gz")
+    export.knn_distance_matrix(cents, ids, k=5, out_npz=knn_npz,
+                               out_tsv=knn_tsv, sample=args.sample)
+    log(f"Step5: 5NN 距离矩阵写出 {knn_npz} / {knn_tsv}")
 
     export.qc_report(os.path.join(args.outdir, "qc_report.json"),
                      n_molecules=expr["n_rows"], n_genes=len(expr["genes"]),
@@ -256,8 +296,12 @@ def main():
                      median_conf=float(np.median(conf[conf > 0])) if (conf > 0).any() else 0.0,
                      roi_frac=float(roi_full.mean()) if roi_full is not None else 1.0,
                      excl_frac_of_roi=float(excl.sum() / max(roi_full.sum(), 1)) if (excl is not None and roi_full is not None) else 0.0,
+                     n_nuclei_flagged=int((flags != "ok").sum()),
+                     sample=args.sample,
                      outputs={"updated_matrix": out_matrix, "cell_by_gene": made,
-                              "cell_mask": p_cellmask})
+                              "cell_mask": p_cellmask,
+                              "nucleus_morphology": p_nucqc,
+                              "knn5_npz": knn_npz, "knn5_tsv": knn_tsv})
     log(f"全部完成。输出目录: {args.outdir}")
 
 
