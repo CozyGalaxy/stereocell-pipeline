@@ -117,7 +117,7 @@ pip install torch --index-url https://download.pytorch.org/whl/cu121   # GPU 可
 pip install cellpose                                                    # GPU 分割后端可选
 ```
 
-## 安装（当前版本 v1.4.0）
+## 安装（当前版本 v1.5.0）
 
 ```bash
 pip install .            # 或 pip install git+https://github.com/<user>/stereocell-pipeline.git
@@ -134,6 +134,17 @@ stereocell-cell-train      --manifest train.tsv --out params_cell.json
 stereocell-cell-segment    --ssdna ssDNA.tif --matrix matrix.txt --outdir out_cells/
 stereocell-run             --smoke-test --outdir /tmp/scell_smoke
 ```
+
+## v1.5.0 新增：高动态范围 ssDNA 暗核修复（脂肪粒亮斑场景）
+
+针对幼虫后期芯片（如 Worker-Larva-5.25d.Y40360K6）脂肪粒大亮斑导致的暗核大面积漏检：
+
+- **根因**：背景扣除后，亮斑周围产生深负值阴影环，使"负值镜像半正态"噪声估计膨胀数倍（K6 实测 3.6 倍），3σ/4σ 阈值吞掉所有暗核；可靠细胞锚点仅 30% 能通过阈值。
+- **修复**（`scell/seeds.py`）：
+  1. 噪声估计改为稳健式 `min(半正态, 2×分位数估计)`，块内估计再以 4 倍全局 σ 封顶；
+  2. ROI 内强度截顶（`clip_q=0.998`，可传 `None` 关闭），压缩极端亮斑的动态范围与阴影污染；
+  3. 有可靠细胞时阈值锚定校准分布：前景阈值 ≤0.45×p20 峰值、种子峰值阈值 = max(0.8×p20, 2.5×σ_bulk)、形态 QC 峰值阈值同步放宽到 0.8×p20；无可靠细胞时行为与旧版一致（稳健 σ 回退）。
+- **K6 裁剪区对照**（4000² 窗口，新旧代码同数据）：亮斑聚集区可靠细胞核召回 14.5% → 67.3%，分子归属率 4.4% → 18.8%，且旧版 809 个"核"过半为亮斑碎片（强度中位 179），新版 552 个核以真实暗核为主（强度中位 19，核内分子中位 54 → 104）；暗区召回 0.9% → 15.3%（暗区细胞 ssDNA 信号接近噪声底，剩余漏检为物理上限，需后续表达矩阵补种子）。
 
 ## v1.4.0 新增：CellBender 环境 RNA 去除输入
 

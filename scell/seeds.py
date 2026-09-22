@@ -5,11 +5,15 @@
 - cellpose (可选, GPU): Cellpose-SAM, 分块推理 + 重叠区投票合并
 
 鲁棒性设计 (针对跨文库差异):
+- 强度截顶 (clip_q): 压缩脂肪粒亮斑等极端高亮, 削弱阴影环对噪声场的污染;
 - 局部背景扣除 (大 sigma 高斯): 消除曝光不均/辉光梯度, 暗区细胞可检出;
-- 分块 Otsu + 全局稳健下限 (median+k*MAD): 暗块不漏检, 空块不过割;
+- 稳健噪声估计 min(半正态, 2×分位数) + 块内 4×全局σ 封顶: 亮斑阴影
+  不再膨胀阈值 (v1.5.0 修复, K6 类芯片暗核召回 14.5%→67.3%);
+- 分块自适应阈值 + 全局稳健下限: 暗块不漏检, 空块不过割;
 - 前景覆盖率护栏: 块内前景占比超 max_cov 时自动提高阈值, 防噪声爆量分割;
 - 形态 QC: 面积/圆度/峰值强度三维过滤, 聚集体与刮擦结构判为伪影;
-- 峰值强度可用可靠细胞位置校准 (每芯片自适应)。
+- 峰值强度用可靠细胞位置校准 (每芯片自适应); 校准模式下阈值锚定
+  校准分布 (0.8×p20), 不再被局部噪声膨胀封顶。
 """
 import numpy as np
 import tifffile
@@ -50,6 +54,34 @@ def _tiles(shape, tile, overlap):
         for x0 in range(0, W, tile - overlap):
             y1, x1 = min(y0 + tile, H), min(x0 + tile, W)
             yield y0, y1, x0, x1
+
+
+def _robust_sigma(v):
+    """局部噪声 σ 稳健估计 (背景扣除后图像)。
+
+    半正态(负值镜像均方)估计在亮斑阴影/辉光污染下可膨胀数倍
+    (K6 芯片实测膨胀 3.6 倍, 暗核被 3σ 阈值整体吞掉);
+    体部分位数估计 (-q15.87) 受大值污染小, 但量化噪声下会偏低。
+    取 min(半正态, 2×分位数) 折中: 干净区域两者相近不改变行为,
+    污染区域由分位数估计封顶。
+    """
+    neg = v[v < 0]
+    if len(neg) < 100:
+        return float(np.std(v)) if len(v) else 1.0
+    sig_hn = float(np.sqrt((np.concatenate([neg, -neg]) ** 2).mean()))
+    sig_q = float(-np.quantile(v, 0.1587))
+    return max(min(sig_hn, 2.0 * sig_q), 1e-3)
+
+
+def _bulk_sigma(v):
+    """噪声体部 σ 估计 (median|neg|/0.6745)。
+
+    对阴影/辉光长尾最不敏感, 但量化噪声下会塌缩; 仅用作校准模式下
+    峰值阈值的噪声下限保护。"""
+    neg = np.abs(v[v < 0])
+    if len(neg) < 100:
+        return 0.0
+    return float(np.median(neg) / 0.6745)
 
 
 def calibrate_peak_thr(norm_small, reliable_xy, nuc_radius, step=1):
@@ -108,7 +140,7 @@ def segment_nuclei(img, backend="skimage", tile=4096, overlap=128,
                    thr_factor=1.0, dense_cov=0.35, dense_mode="auto",
                    roi_mask=None, excl_mask=None, bg_sigma=None,
                    max_cov=0.35, max_size=1500, min_circ=0.5,
-                   reliable_xy=None, log=print):
+                   reliable_xy=None, clip_q=0.998, log=print):
     """返回 int32 label mask (0=背景)。
 
     thr_factor: Otsu 阈值倍率 (>1 更严格); dense_cov: 前景占比超过该值视为致密组织;
@@ -116,12 +148,23 @@ def segment_nuclei(img, backend="skimage", tile=4096, overlap=128,
     roi_mask: 芯片区域 (None=全图); excl_mask: 伪影排除区 (True=排除);
     bg_sigma: 局部背景高斯 sigma (None=自适应 6*nuc_radius, 下限20);
     max_cov: 块内前景覆盖率护栏; max_size/min_circ: 形态 QC 上限;
-    reliable_xy: 可靠细胞质心 (N,2), 用于校准峰值强度阈值。
+    reliable_xy: 可靠细胞质心 (N,2), 用于校准峰值强度阈值;
+    clip_q: ROI 内强度截顶分位 (None 关闭; 压缩脂肪粒亮斑等极端高亮,
+            削弱其阴影环对噪声估计与阈值场的污染)。
     """
     img = img.astype(np.float32)
     H, W = img.shape
     if roi_mask is None:
         roi_mask = np.ones((H, W), bool)
+    if clip_q is not None:
+        roi_vals_sub = img[roi_mask]
+        roi_vals_sub = roi_vals_sub[::max(1, len(roi_vals_sub) // 2_000_000)]
+        hi_clip = float(np.quantile(roi_vals_sub, clip_q))
+        del roi_vals_sub
+        if hi_clip > 0 and img.max() > hi_clip:
+            orig_max = float(img.max())
+            img = np.minimum(img, hi_clip)
+            log(f"  强度截顶: q{clip_q}={hi_clip:.0f} (原 max={orig_max:.0f})")
     if bg_sigma is None:
         bg_sigma = max(20.0, 6 * nuc_radius)
 
@@ -135,24 +178,24 @@ def segment_nuclei(img, backend="skimage", tile=4096, overlap=128,
     norm_full = ndi.gaussian_filter(img - bg, 1.0)
     del img_s, bg_s, bg
 
-    # ---- 全局统计 (降采样视图, ROI 内): 半正态噪声 sigma + 峰值校准 ----
+    # ---- 全局统计 (降采样视图, ROI 内): 稳健噪声 sigma + 峰值校准 ----
     step = max(1, H // 1024)
     norm_small = norm_full[::step, ::step]
     roi_small = roi_mask[::step, ::step]
     vals = norm_small[roi_small]
-    neg = vals[vals < 0]
-    if len(neg) > 100:
-        # 半正态噪声估计: 负值镜像, 对 uint8 量化噪声比 MAD 稳健
-        sig_g = float(np.sqrt((np.concatenate([neg, -neg]) ** 2).mean()))
-    else:
-        sig_g = float(np.std(vals)) if len(vals) else 1.0
-    sig_g = max(sig_g, 1e-3)
+    sig_g = _robust_sigma(vals)
+    sig_bulk = _bulk_sigma(vals)
     floor = 3 * sig_g           # 前景阈值下限
     peak_thr = calibrate_peak_thr(norm_full, reliable_xy, nuc_radius, 1)
-    if peak_thr is None:
+    calibrated = peak_thr is not None
+    if not calibrated:
         peak_thr = 5 * sig_g    # 无可靠细胞时的回退峰值阈值
+    # 校准模式: 阈值锚定可靠细胞峰值分布, 不再被局部噪声膨胀封顶。
+    # p20 的 0.8 倍仍远高于噪声体部 (K6 实测 ~10σ_bulk), 特异性不损失。
+    seed_thr_cal = max(0.8 * peak_thr, 2.5 * sig_bulk) if calibrated else None
+    qc_thr = 0.8 * peak_thr if calibrated else peak_thr
     log(f"  全局统计: bg_sigma={bg_sigma:.0f} sigma={sig_g:.2f} "
-        f"floor={floor:.2f} peak_thr={peak_thr:.2f}")
+        f"floor={floor:.2f} peak_thr={peak_thr:.2f} calibrated={calibrated}")
 
     # 致密组织回退: 前景占比过高时距离变换 watershed 退化为少数巨块,
     # 改用强度局部极大值作为种子 (UMI-core 思路, 与 CellBin Stereo-cell 一致)
@@ -180,13 +223,17 @@ def segment_nuclei(img, backend="skimage", tile=4096, overlap=128,
             m, _, _ = model.eval(sub, diameter=2 * nuc_radius)
             m = m.astype(np.int32)
         else:
-            # 切片共用全分辨率 norm; 块内半正态噪声 -> 3σ 前景阈值
+            # 切片共用全分辨率 norm; 块内稳健噪声 -> 3σ 前景阈值,
+            # 并以 4 倍全局 σ 封顶 (亮斑聚集块的局部估计不可靠)
             norm = norm_full[y0:y1, x0:x1]
             v = norm[roi_t]
-            neg_t = v[v < 0]
-            sig_t = float(np.sqrt((np.concatenate([neg_t, -neg_t]) ** 2).mean())) if len(neg_t) > 100 else sig_g
+            sig_t = min(_robust_sigma(v), 4 * sig_g) if len(v) > 100 else sig_g
             thr = max(3 * sig_t * thr_factor, 0.5 * floor)
             thr_pk = max(4 * sig_t * thr_factor, peak_thr)
+            if calibrated:
+                # 校准锚定: 前景阈值不超过 0.45×p20 峰值, 峰值阈值取 0.8×p20
+                thr = min(thr, 0.45 * peak_thr * thr_factor)
+                thr_pk = min(thr_pk, seed_thr_cal * thr_factor)
             fg = (norm > thr) & roi_t
             # 前景覆盖率护栏: 防空块/噪声块过割
             cov = fg.sum() / max(int(roi_t.sum()), 1)
@@ -214,8 +261,8 @@ def segment_nuclei(img, backend="skimage", tile=4096, overlap=128,
                     seed[tuple(pk.T)] = True
                 m = segmentation.watershed(-dist, markers=measure.label(seed), mask=fg)
             m = _remove_small(m.astype(np.int32), min_size)
-            # 形态 QC: 面积/圆度/峰值 (可靠细胞校准)
-            m = _morpho_qc(m, norm, min_size, max_size, min_circ, peak_thr)
+            # 形态 QC: 面积/圆度/峰值 (可靠细胞校准; 校准模式 QC 阈值同步放宽)
+            m = _morpho_qc(m, norm, min_size, max_size, min_circ, qc_thr)
         if m.max() == 0:
             continue
         # 只保留块中心区域的结果, 消除分块边缘重复
