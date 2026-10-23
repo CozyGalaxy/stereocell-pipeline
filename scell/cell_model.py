@@ -80,7 +80,7 @@ def segment_cells(img, expr, p: CellParams, device="cpu", seed_backend="skimage"
     ambient = scassign.estimate_ambient(expr["gene_codes"], expr["mid"],
                                         mol_nuc > 0)
     pi = scassign.init_pi(nuclei, ix, iy, expr["gene_codes"],
-                          len(expr["genes"]), len(ids), ambient)
+                          len(expr["genes"]), len(ids), ambient, cell_ids=ids)
     assign, conf = scassign.em_assign(
         np.stack([expr["x"], expr["y"]], 1).astype(np.float32),
         expr["gene_codes"], expr["mid"], cents, pi, ambient,
@@ -175,7 +175,7 @@ def train(datasets, base: CellParams = None, backend="skimage", device="cpu",
             ambient = scassign.estimate_ambient(
                 expr["gene_codes"], expr["mid"], nuclei[iy, ix] > 0)
             pi = scassign.init_pi(nuclei, ix, iy, expr["gene_codes"],
-                                  len(expr["genes"]), len(res0["ids"]), ambient)
+                                  len(expr["genes"]), len(res0["ids"]), ambient, cell_ids=res0["ids"])
             margin_i = np.where(res0["crowded"], dm, mg)
             a, c = scassign.em_assign(
                 np.stack([expr["x"], expr["y"]], 1).astype(np.float32),

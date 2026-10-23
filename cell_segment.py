@@ -129,6 +129,16 @@ def main():
     pass_mask = scqc.filter_cells(metrics, mito_max=p.mito_max)
     scqc.write_qc_csv(os.path.join(args.outdir, "cell_qc.csv"),
                       metrics, pass_mask, conf_mean=conf_mean)
+    # v1.6.0: 并入核形态/亮度 QC 列 (peak_norm/snr/contrast/morph_flag 等)
+    import pandas as pd
+    _cq = pd.read_csv(os.path.join(args.outdir, "cell_qc.csv"))
+    _mq = morph.rename(columns={"label": "cell_id"})[
+        ["cell_id"] + [c for c in ("area", "circularity", "eccentricity",
+                                   "max_intensity", "mean_intensity", "peak_norm",
+                                   "bg_local", "snr", "contrast", "morph_flag")
+                       if c in morph.columns]]
+    _cq = _cq.merge(_mq, on="cell_id", how="left")
+    _cq.to_csv(os.path.join(args.outdir, "cell_qc.csv"), index=False)
     log(f"QC: {pass_mask.sum()}/{len(ids)} 细胞通过 (mito>{p.mito_max:.0%} 过滤 "
         f"{(~pass_mask).sum()} 个)")
 

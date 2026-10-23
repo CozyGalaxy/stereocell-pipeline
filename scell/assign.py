@@ -21,14 +21,25 @@ def build_candidates(mol_xy, centers, r):
     return cand_mol[order], cand_cell[order]
 
 
-def init_pi(nuclei_mask, ix, iy, gene_codes, n_genes, n_cells, ambient_gene, min_nuc_mols=5):
-    """逐细胞初始基因谱: 核内分子基因分布; 核内分子太少的细胞用背景谱。"""
+def init_pi(nuclei_mask, ix, iy, gene_codes, n_genes, n_cells, ambient_gene,
+            min_nuc_mols=5, cell_ids=None):
+    """逐细胞初始基因谱: 核内分子基因分布; 核内分子太少的细胞用背景谱。
+
+    cell_ids: 实际核 label 数组 (升序)。核 mask 标签存在空洞时
+    (如假阳性过滤后) 必须传入, 将 label 映射到 0..n_cells-1 行号。"""
     pi = np.tile(ambient_gene, (n_cells, 1)).astype(np.float64)
     lab = nuclei_mask[iy, ix]
     cnt = np.zeros((n_cells, n_genes))
     m = lab > 0
     if m.any():
-        np.add.at(cnt, (lab[m] - 1, gene_codes[m]), 1.0)
+        if cell_ids is not None:
+            cell_ids = np.asarray(cell_ids)
+            row = np.searchsorted(cell_ids, lab[m])
+            row_c = np.minimum(row, len(cell_ids) - 1)
+            valid = cell_ids[row_c] == lab[m]
+            np.add.at(cnt, (row_c[valid], gene_codes[m][valid]), 1.0)
+        else:
+            np.add.at(cnt, (lab[m] - 1, gene_codes[m]), 1.0)
     has = cnt.sum(1) >= min_nuc_mols
     pi[has] = cnt[has] + 0.5
     pi[has] /= pi[has].sum(1, keepdims=True)

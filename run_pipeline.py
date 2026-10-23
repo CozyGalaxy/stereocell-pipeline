@@ -51,6 +51,8 @@ def main():
     ap.add_argument("--max-cov", type=float, default=0.35, help="块内前景覆盖率护栏")
     ap.add_argument("--max-size", type=int, default=1500, help="细胞核面积上限(像素)")
     ap.add_argument("--min-circ", type=float, default=0.5, help="细胞核圆度下限")
+    ap.add_argument("--no-fp-filter", action="store_true",
+                    help="关闭假阳性核过滤 (校准模式下默认标记并移除噪声斑点/碎屑丝)")
     ap.add_argument("--sample", default=None,
                     help="文库名: 输出矩阵/h5ad/5NN 中细胞命名为 sample.ID (非细胞=0)")
     ap.add_argument("--force", action="store_true")
@@ -160,35 +162,71 @@ def main():
         tifffile.imwrite(p_nucmask, nuclei.astype(np.int32))
         log(f"Step1 完成: 检出核 {nuclei.max()} 个")
     nuclei = nuclei.astype(np.int32)
-    ids, areas, cents = seeds.nuclei_stats(nuclei)
-    r_nuc_med = float(np.median(np.sqrt(areas / np.pi)))
 
     # ---- 核一致性质量评估 (Step1b): 同物种核大小应均一、近似椭圆 ----
+    # v1.6.0: 核 QC 增加亮度/对比度列 (peak_norm/bg_local/snr/contrast),
+    # 校准模式下标记并过滤疑似假阳性核 (噪声斑点/碎屑丝), 匹配到可靠细胞的核不过滤。
     p_nucqc = os.path.join(args.outdir, "02_nucleus_morphology.csv")
+    fp_info = None
     if os.path.exists(p_nucqc) and not args.force:
         morph = pd.read_csv(p_nucqc)
         flags = morph["morph_flag"].values
+        n_noise = int((flags == "noise_suspect").sum())
+        n_deb = int((flags == "debris_suspect").sum())
+        if n_noise + n_deb:
+            fp_info = dict(n_noise_suspect=n_noise, n_debris_suspect=n_deb)
         log("Step1b 跳过: 核形态 QC 已存在")
     else:
         img = tifffile.imread(args.ssdna)
         if img.ndim > 2:
             img = img.squeeze()
-        morph = seeds.nucleus_morphology(nuclei, img)
+        morph = seeds.nucleus_morphology(nuclei, img, roi_mask=roi_full)
         flags, (alo, ahi) = seeds.classify_nuclei(morph)
-        morph["morph_flag"] = flags
+        # ---- 假阳性过滤 (仅校准模式): 可靠细胞匹配的核作参考 ----
+        if reliable_xy is not None and not args.no_fp_filter:
+            from scipy.spatial import cKDTree
+            r_nuc0 = float(np.median(np.sqrt(morph["area"] / np.pi)))
+            d_rel, _ = cKDTree(reliable_xy).query(morph[["cx", "cy"]].values)
+            matched = d_rel <= max(15.0, 2 * r_nuc0)
+            sus, fp_info = seeds.suspect_nuclei(morph, matched, min_size=30)
+            if fp_info is not None and (sus != "ok").any():
+                flags = np.where(sus != "ok", sus, flags)
+                morph["morph_flag"] = flags
+                sus_ids = morph.loc[sus != "ok", "label"].values.astype(np.int32)
+                tifffile.imwrite(p_nucmask.replace(".tif", "_raw.tif"),
+                                 nuclei.astype(np.int32))
+                nuclei = nuclei.copy()
+                nuclei[np.isin(nuclei, sus_ids)] = 0
+                tifffile.imwrite(p_nucmask, nuclei.astype(np.int32))
+                log(f"Step1b: 假阳性过滤 标记 {int((sus != 'ok').sum())} 个疑似核 "
+                    f"(noise={fp_info['n_noise_suspect']}, debris={fp_info['n_debris_suspect']}, "
+                    f"area<{fp_info['area_floor']:.0f}px 且 peak<{fp_info['peak_floor']:.1f}; "
+                    f"原始 mask 存 01_nuclei_mask_raw.tif)")
+            else:
+                morph["morph_flag"] = flags
+        else:
+            morph["morph_flag"] = flags
         morph.to_csv(p_nucqc, index=False)
         n_bad = int((flags != "ok").sum())
         log(f"Step1b: 核形态 QC 写出 {p_nucqc} (合法面积 {alo:.0f}-{ahi:.0f}px, "
             f"异常 {n_bad}/{len(flags)}: " +
             ", ".join(f"{t}={int((flags == t).sum())}" for t in sorted(set(flags)) if t != "ok")
             + ")")
-        # 分色 overlay: 正常红 / 聚集黄 / 双核橙 / 拉长品红 / 规则小点绿 / 碎片青
+        # 分色 overlay: 正常红 / 聚集黄 / 双核橙 / 拉长品红 / 规则小点绿 / 碎片青 / 疑似假阳性灰白
         lab2flag = dict(zip(morph["label"].values, flags))
         colors = {int(l): seeds.MORPH_FLAG_COLORS[f] for l, f in lab2flag.items()
                   if f != "ok"}
-        seeds.write_overlay(img, nuclei, os.path.join(args.outdir, "seeds_overlay.png"),
+        ov_mask = tifffile.imread(p_nucmask.replace(".tif", "_raw.tif")) \
+            if os.path.exists(p_nucmask.replace(".tif", "_raw.tif")) else nuclei
+        seeds.write_overlay(img, ov_mask, os.path.join(args.outdir, "seeds_overlay.png"),
                             excl_mask=excl, label_colors=colors)
+        del ov_mask
         log("seeds_overlay 已输出 (按核质量分色)")
+
+    ids, areas, cents = seeds.nuclei_stats(nuclei)
+    r_nuc_med = float(np.median(np.sqrt(areas / np.pi)))
+    if len(ids):
+        log(f"Step1c: 进入下游的核 {len(ids)} 个 (过滤后)")
 
     # 种子 QC: 核内分子数 / 匹配预分配 label / 是否可靠
     ix = np.clip(expr["x"], 0, nuclei.shape[1] - 1)
@@ -235,6 +273,19 @@ def main():
             f.write(f"{sid},{cents[k][0]:.1f},{cents[k][1]:.1f},{d_nn[k]:.1f},"
                     f"{R_i[k]:.1f},{sigma_arr[k]:.2f},{margin_i[k]:.2f},{int(crowded[k])}\n")
 
+    # ---------- Step 2b: 逐细胞质量评估汇总 (v1.6.0) ----------
+    # 合并核形态 (亮度/对比度/SNR/形态flag) + 核内分子数 + 预分配匹配 + 扩散参数,
+    # 供下游按 ssDNA 核质量进一步过滤细胞。
+    p_cellqc = os.path.join(args.outdir, "04_cell_qc.csv")
+    if not (os.path.exists(p_cellqc) and not args.force):
+        _qc = morph.rename(columns={"label": "seed_id"})
+        _sq = pd.read_csv(p_seedqc)
+        _pq = pd.read_csv(p_params)
+        _qc = _qc.merge(_sq, on="seed_id", how="outer").merge(_pq, on="seed_id", how="outer")
+        _qc["used_for_cell"] = _qc["seed_id"].isin(set(ids.tolist()))
+        _qc.to_csv(p_cellqc, index=False)
+        log(f"Step2b: 逐细胞质量评估写出 {p_cellqc} ({len(_qc)} 行)")
+
     # ---------- Step 3: EM 归属 ----------
     # 候选半径密度护栏 (候选截断仅作效率护栏, 分割决策仍由 margin_i 控制)
     d_med = float(np.median(d_nn)) if len(d_nn) else r95
@@ -249,7 +300,7 @@ def main():
                                             np.isin(mol_nuc, ids))
         pi = scassign.init_pi(nuclei, ix, iy, expr["gene_codes"],
                               len(expr["genes"]), len(ids), ambient,
-                              min_nuc_mols=args.min_nuc_mols)
+                              min_nuc_mols=args.min_nuc_mols, cell_ids=ids)
         assign, conf = scassign.em_assign(
             np.stack([expr["x"], expr["y"]], 1).astype(np.float32),
             expr["gene_codes"], expr["mid"], cents, pi, ambient,
@@ -297,6 +348,9 @@ def main():
                      roi_frac=float(roi_full.mean()) if roi_full is not None else 1.0,
                      excl_frac_of_roi=float(excl.sum() / max(roi_full.sum(), 1)) if (excl is not None and roi_full is not None) else 0.0,
                      n_nuclei_flagged=int((flags != "ok").sum()),
+                     n_fp_suspect=int((fp_info["n_noise_suspect"] + fp_info["n_debris_suspect"]) if fp_info else 0),
+                     fp_filter=fp_info if fp_info else None,
+                     cell_qc_csv=p_cellqc,
                      sample=args.sample,
                      outputs={"updated_matrix": out_matrix, "cell_by_gene": made,
                               "cell_mask": p_cellmask,

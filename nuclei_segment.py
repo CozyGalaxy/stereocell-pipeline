@@ -43,6 +43,8 @@ def main():
                     help="可靠细胞列表 (可选): 校准峰值强度阈值")
     ap.add_argument("--no-roi", action="store_true", help="关闭芯片区域识别")
     ap.add_argument("--no-excl", action="store_true", help="关闭伪影排除")
+    ap.add_argument("--no-fp-filter", action="store_true",
+                    help="关闭假阳性核过滤 (校准模式下默认标记并移除噪声斑点/碎屑丝)")
     args = ap.parse_args()
 
     from scipy import ndimage as ndi
@@ -96,7 +98,32 @@ def main():
     ids, areas, cents = seeds.nuclei_stats(mask)
     log(f"检出核 {len(ids)} 个")
 
-    # 文本输出: 每个属于核的像素 (流式, 内存安全)
+    # 汇总 + 核一致性质量评估 (同物种核大小应均一、近似椭圆)
+    # v1.6.0: 核 QC 增加亮度/对比度列; 校准模式标记并过滤疑似假阳性核
+    morph = seeds.nucleus_morphology(mask, img, roi_mask=roi_mask)
+    flags, (alo, ahi) = seeds.classify_nuclei(morph)
+    if reliable_xy is not None and not args.no_fp_filter:
+        from scipy.spatial import cKDTree
+        r_nuc0 = float(np.median(np.sqrt(morph["area"] / np.pi)))
+        d_rel, _ = cKDTree(reliable_xy).query(morph[["cx", "cy"]].values)
+        matched = d_rel <= max(15.0, 2 * r_nuc0)
+        sus, fp_info = seeds.suspect_nuclei(morph, matched, min_size=p.min_size)
+        if fp_info is not None and (sus != "ok").any():
+            flags = np.where(sus != "ok", sus, flags)
+            sus_ids = morph.loc[sus != "ok", "label"].values.astype(np.int32)
+            p_mask = os.path.join(args.outdir, "nuclei_mask.tif")
+            os.replace(p_mask, os.path.join(args.outdir, "nuclei_mask_raw.tif"))
+            mask = mask.copy()
+            mask[np.isin(mask, sus_ids)] = 0
+            ids, areas, cents = seeds.nuclei_stats(mask)
+            tifffile.imwrite(p_mask, mask.astype(np.int32))
+            log(f"假阳性过滤: 标记并移除 {int((sus != 'ok').sum())} 个疑似核 "
+                f"(noise={fp_info['n_noise_suspect']}, debris={fp_info['n_debris_suspect']}, "
+                f"area<{fp_info['area_floor']:.0f}px 且 peak<{fp_info['peak_floor']:.1f}), "
+                f"剩余 {len(ids)} 核进入下游")
+    morph["morph_flag"] = flags
+
+    # 文本输出: 每个属于核的像素 (流式, 内存安全; 过滤后的 mask)
     p_map = os.path.join(args.outdir, "nuclei_pixel_map.tsv.gz")
     import gzip
     with gzip.open(p_map, "wt") as f:
@@ -106,14 +133,10 @@ def main():
             sl = slice(k, k + 1_000_000)
             f.write("".join(f"{xs[i]}\t{ys[i]}\t{mask[ys[i], xs[i]]}\n"
                             for i in range(sl.start, min(sl.stop, len(ys)))))
-    # 汇总 + 核一致性质量评估 (同物种核大小应均一、近似椭圆)
-    morph = seeds.nucleus_morphology(mask, img)
-    flags, (alo, ahi) = seeds.classify_nuclei(morph)
-    morph["morph_flag"] = flags
     out = morph.rename(columns={"label": "nucleus_id", "area": "area_px"})
     cols = ["nucleus_id", "cx", "cy", "area_px", "circularity", "eccentricity",
             "solidity", "major_axis", "minor_axis", "mean_intensity",
-            "max_intensity", "morph_flag"]
+            "max_intensity", "peak_norm", "bg_local", "snr", "contrast", "morph_flag"]
     out[[c for c in cols if c in out.columns]].to_csv(
         os.path.join(args.outdir, "nuclei_summary.csv"), index=False)
     log(f"核形态 QC: 合法面积 {alo:.0f}-{ahi:.0f}px, 异常 {int((flags != 'ok').sum())}/{len(flags)} ("
@@ -121,7 +144,9 @@ def main():
         + ")")
     colors = {int(l): seeds.MORPH_FLAG_COLORS[f]
               for l, f in zip(morph["label"].values, flags) if f != "ok"}
-    seeds.write_overlay(img, mask, os.path.join(args.outdir, "nuclei_overlay.png"),
+    ov_mask = tifffile.imread(os.path.join(args.outdir, "nuclei_mask_raw.tif")) \
+        if os.path.exists(os.path.join(args.outdir, "nuclei_mask_raw.tif")) else mask
+    seeds.write_overlay(img, ov_mask, os.path.join(args.outdir, "nuclei_overlay.png"),
                         excl_mask=excl_mask, label_colors=colors)
     p.save(os.path.join(args.outdir, "params_used.json"))
     log(f"完成。输出: {args.outdir}")

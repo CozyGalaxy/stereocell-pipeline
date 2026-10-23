@@ -117,7 +117,7 @@ pip install torch --index-url https://download.pytorch.org/whl/cu121   # GPU 可
 pip install cellpose                                                    # GPU 分割后端可选
 ```
 
-## 安装（当前版本 v1.5.0）
+## 安装（当前版本 v1.6.0）
 
 ```bash
 pip install .            # 或 pip install git+https://github.com/<user>/stereocell-pipeline.git
@@ -134,6 +134,29 @@ stereocell-cell-train      --manifest train.tsv --out params_cell.json
 stereocell-cell-segment    --ssdna ssDNA.tif --matrix matrix.txt --outdir out_cells/
 stereocell-run             --smoke-test --outdir /tmp/scell_smoke
 ```
+
+## v1.6.0 新增：假阳性核过滤与逐核/逐细胞质量评估
+
+针对背景污染强的文库（如 bee-egg-36h.Y40360E8）将噪声斑点/碎屑丝误判为细胞核的问题：
+
+- **根因**：可靠细胞坐标是分子云质心，与核位置存在偏移（扩散越大偏移越明显），
+  旧版校准搜索半径 (2×核半径) 会把背景峰当校准样本，导致峰值阈值塌陷到噪声水平，
+  噪声斑点因而通过阈值与形态 QC。
+- **核 QC 新列**（`02_nucleus_morphology.csv` / `nuclei_summary.csv`）：
+  `peak_norm`（局部背景扣除后峰值）、`bg_local`（局部背景）、`snr`（峰值/全局稳健噪声σ）、
+  `contrast`（峰值/背景比值），配合原有面积/圆度/偏心率。
+- **假阳性过滤**（校准模式默认开启，`--no-fp-filter` 关闭；`stereocell-run` 与
+  `nuclei-segment` 均支持）：以匹配到可靠细胞的核为参考（同物种核大小/亮度均一），
+  标记 `noise_suspect`（面积 <0.3×参考中位 且 peak_norm <0.3×参考中位）与
+  `debris_suspect`（偏心率 >0.96 且暗）；疑似核从下游移除，原始 mask 保留为
+  `01_nuclei_mask_raw.tif`，overlay 中灰/白分色可复查；匹配到可靠细胞的核永不过滤。
+- **逐细胞质量汇总** `04_cell_qc.csv`（stereocell-run）/ `cell_qc.csv` 增加核 QC 列
+  （cell-segment）：ssDNA 核亮度、背景比值、SNR、形态 flag、核内分子数、预分配匹配、
+  扩散参数，供下游按核可靠性过滤细胞。
+- 校准搜索半径放宽到 3×核半径；`init_pi` 支持过滤后的非连续标签。
+- **回归安全性**：好芯片（Female-Embryo-36h.Y40360J7 致密窗口）核数 65→63，
+  假阳性过滤 0 触发；E8 假阳性密集窗口核数 739→103（噪声斑点清除），
+  可靠细胞召回 60.5% 不变。无督导模式行为完全不变。
 
 ## v1.5.0 新增：高动态范围 ssDNA 暗核修复（脂肪粒亮斑场景）
 

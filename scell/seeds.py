@@ -94,7 +94,9 @@ def calibrate_peak_thr(norm_small, reliable_xy, nuc_radius, step=1):
     if reliable_xy is None or len(reliable_xy) < 30:
         return None
     H, W = norm_small.shape
-    r = max(2, int(np.ceil(2 * nuc_radius / step)))
+    # v1.6.0: 搜索半径 2→3 倍核半径。可靠细胞坐标是分子云质心,
+    # 与核位置可有偏移 (扩散大时更明显), 半径过小会把背景峰当校准样本
+    r = max(2, int(np.ceil(3 * nuc_radius / step)))
     peaks = []
     for x, y in reliable_xy:
         sx, sy = int(x / step), int(y / step)
@@ -298,13 +300,21 @@ MORPH_FLAG_COLORS = {
     "elongated":     (1.00, 0.00, 1.00),  # 品红: 拉长 (刮擦残余/聚集拉伸)
     "tiny_round":    (0.00, 1.00, 0.00),  # 绿:   过小且完全规则 (染色碎屑/扩散伪点)
     "tiny":          (0.00, 1.00, 1.00),  # 青:   过小碎片
+    "noise_suspect": (0.60, 0.60, 0.60),  # 灰:   疑似噪声斑点假阳性 (小且暗)
+    "debris_suspect":(1.00, 1.00, 1.00),  # 白:   疑似碎屑丝假阳性 (狭长且暗)
 }
 
 
-def nucleus_morphology(mask, img=None):
+def nucleus_morphology(mask, img=None, bg_sigma=30.0, roi_mask=None):
     """逐核形态学指标, 返回 pandas DataFrame:
     label, cx, cy, area, perimeter, circularity, eccentricity, solidity,
-    major_axis, minor_axis [, mean_intensity, max_intensity]。
+    major_axis, minor_axis [, mean_intensity, max_intensity,
+    peak_norm, bg_local, snr, contrast]。
+
+    peak_norm: 局部背景扣除后的核峰值 (4 倍降采样, 与 segment_nuclei 预处理一致);
+    bg_local: 核质心处局部背景; snr = peak_norm / 全局稳健噪声σ;
+    contrast = (max_intensity - bg_local) / bg_local。后四列供假阳性甄别:
+    噪声斑点/碎屑丝的 peak_norm 与 snr 远低于真实核。
     """
     import pandas as pd
     props = ("label", "area", "perimeter", "eccentricity", "solidity",
@@ -320,7 +330,66 @@ def nucleus_morphology(mask, img=None):
     df = df.rename(columns={"centroid-0": "cy", "centroid-1": "cx",
                             "major_axis_length": "major_axis",
                             "minor_axis_length": "minor_axis"})
+    if img is not None and len(df):
+        ds = 4
+        im_s = img.astype(np.float32)[::ds, ::ds]
+        bg_s = ndi.gaussian_filter(im_s, bg_sigma / ds)
+        norm_s = im_s - bg_s
+        del im_s
+        v = norm_s[roi_mask[::ds, ::ds]] if roi_mask is not None else norm_s[::4, ::4].ravel()
+        sig = _robust_sigma(v)
+        h, w = norm_s.shape
+        cy = np.clip((df["cy"].values / ds).astype(int), 0, h - 1)
+        cx = np.clip((df["cx"].values / ds).astype(int), 0, w - 1)
+        df["bg_local"] = bg_s[cy, cx]
+        peak = np.zeros(len(df))
+        slices = ndi.find_objects(mask)
+        for k, lab in enumerate(df["label"].values.astype(int)):
+            sl = slices[lab - 1] if lab - 1 < len(slices) else None
+            if sl is None:
+                continue
+            y0, x0 = sl[0].start // ds, sl[1].start // ds
+            y1, x1 = min(h, sl[0].stop // ds + 2), min(w, sl[1].stop // ds + 2)
+            peak[k] = norm_s[y0:y1, x0:x1].max()
+        df["peak_norm"] = peak
+        df["snr"] = peak / max(sig, 1e-3)
+        df["contrast"] = ((df["max_intensity"].values - df["bg_local"].values)
+                          / np.maximum(df["bg_local"].values, 1.0))
     return df
+
+
+def suspect_nuclei(morph, matched_ref, min_size=30,
+                   area_frac=0.3, peak_frac=0.3, debris_ecc=0.96,
+                   debris_boost=1.5, min_ref=30):
+    """校准模式下标记疑似假阳性核 (噪声斑点 / 碎屑丝)。
+
+    matched_ref: bool 数组 —— 核质心匹配到可靠细胞 (锚定参考, 永不标记)。
+    参考值取可靠匹配核的中位数 (同物种核大小/亮度应均一):
+      noise_suspect : area < area_frac×med_area 且 peak_norm < peak_frac×med_peak
+      debris_suspect: eccentricity > debris_ecc 且 peak_norm < debris_boost×peak_floor
+    可靠匹配数 < min_ref 时不启用 (返回全 "ok" 与 None info), 无督导流程行为不变。
+    返回 (flags: np.array[str], info: dict|None)。
+    """
+    flags = np.full(len(morph), "ok", dtype=object)
+    matched_ref = np.asarray(matched_ref, bool)
+    if matched_ref.sum() < min_ref or "peak_norm" not in morph.columns:
+        return flags, None
+    ref = morph[matched_ref]
+    med_area = float(ref["area"].median())
+    med_peak = float(ref["peak_norm"].median())
+    area_floor = max(float(min_size), area_frac * med_area)
+    peak_floor = peak_frac * med_peak
+    area = morph["area"].values
+    peak = morph["peak_norm"].values
+    ecc = morph["eccentricity"].values
+    sus_noise = (~matched_ref) & (area < area_floor) & (peak < peak_floor)
+    sus_debris = (~matched_ref) & (ecc > debris_ecc) & (peak < debris_boost * peak_floor)
+    flags[sus_noise] = "noise_suspect"
+    flags[sus_debris] = "debris_suspect"
+    info = dict(n_ref=int(matched_ref.sum()), med_area=med_area, med_peak=med_peak,
+                area_floor=area_floor, peak_floor=peak_floor,
+                n_noise_suspect=int(sus_noise.sum()), n_debris_suspect=int(sus_debris.sum()))
+    return flags, info
 
 
 def classify_nuclei(df, z=6.0, min_area_floor=30, elong_ecc=0.90,
