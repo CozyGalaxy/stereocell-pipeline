@@ -314,7 +314,7 @@ def main():
 
     # ---------- Step 4: 领地栅格化 + 输出 ----------
     log("Step4: 领地栅格化与导出")
-    cell_mask = export.rasterize_cells(umi, nuclei, cents, R_i)
+    cell_mask = export.rasterize_cells(umi, nuclei, cents, R_i, ids=ids)
     tifffile.imwrite(p_cellmask, cell_mask)
     img = tifffile.imread(args.ssdna)
     # 细胞 overlay 沿用核形态分色 (细胞 ID == 核 ID)

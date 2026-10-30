@@ -88,7 +88,7 @@ def segment_cells(img, expr, p: CellParams, device="cpu", seed_backend="skimage"
         r_cand=r_cand, margin_i=margin_i, conf_thr=p.conf_thr, w_b=p.w_b,
         n_iter=p.em_iter, device=device, log=log)
 
-    cell_mask = export.rasterize_cells(umi, nuclei, cents, R_i)
+    cell_mask = export.rasterize_cells(umi, nuclei, cents, R_i, ids=ids)
     return dict(nuclei=nuclei, ids=ids, areas=areas, cents=cents,
                 r_nuc_med=r_nuc_med, lam=lam, r95=r95, D_ISO=D_ISO,
                 isolated=isolated, d_nn=d_nn, R_i=R_i, margin_i=margin_i,

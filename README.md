@@ -117,7 +117,7 @@ pip install torch --index-url https://download.pytorch.org/whl/cu121   # GPU 可
 pip install cellpose                                                    # GPU 分割后端可选
 ```
 
-## 安装（当前版本 v1.6.1）
+## 安装（当前版本 v1.6.2）
 
 ```bash
 pip install .            # 或 pip install git+https://github.com/<user>/stereocell-pipeline.git
@@ -134,6 +134,22 @@ stereocell-cell-train      --manifest train.tsv --out params_cell.json
 stereocell-cell-segment    --ssdna ssDNA.tif --matrix matrix.txt --outdir out_cells/
 stereocell-run             --smoke-test --outdir /tmp/scell_smoke
 ```
+
+## v1.6.2 修复：cell_mask 真实核 label + 全输出 ID 一致性审计
+
+- **修复**：v1.6.1 修正了 `matrix_updated` 的序号→label 映射，但 `06_cell_mask.tif` /
+  `cell_mask.tif`（`scell/export.py::rasterize_cells`）内部仍写位置序号 1..N。v1.6.2
+  起 `rasterize_cells(..., ids=ids)` 经映射表写出真实核 label，`run_pipeline.py` 与
+  `scell/cell_model.py` 两处调用均已传入。
+- **审计结论（E8 含标签空洞数据验证）**：
+  - `run_pipeline.py`：`matrix_updated` / `cells_x_genes` barcodes / `cell_5nn_dist` /
+    `04_cell_qc`(used) / `04_cell_params` / `02_seed_qc` / `02_nucleus_morphology` /
+    `06_cell_mask` 全部一致（真实核 label）。
+  - `cell_segment.py`：`matrix_cell_id` == `cell_qc` pass 细胞 == barcodes；`cell_pixel_map` /
+    `cell_qc` 含全部细胞（含 mito 被滤者，矩阵仅含 pass 细胞属设计语义）；`syncytium_pairs`
+    的细胞 ID ⊆ `cell_qc`。
+- **影响面**：仅 v1.6.0 起触发了假阳性过滤（标签出现空洞）的结果受影响；无空洞时
+  位置序号==label，旧结果无需重跑。
 
 ## v1.6.1 修复：输出文件间 cell_id 一致性
 

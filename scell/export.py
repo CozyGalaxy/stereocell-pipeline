@@ -5,11 +5,14 @@ from scipy import ndimage as ndi
 from skimage import segmentation
 
 
-def rasterize_cells(umi, nuclei_mask, centers, R_i, sigma_blur=3.0):
+def rasterize_cells(umi, nuclei_mask, centers, R_i, sigma_blur=3.0, ids=None):
     """逐细胞 R_i 约束的 watershed 生成最终细胞领地 mask。
+
     高程图 = -UMI密度(高斯平滑); 允许区域 = 距最近种子 < 该种子 R_i 的像素;
     markers = 核 label。保证每细胞领地包含其核且不越出自适应半径。
     最近种子查询用 cKDTree (内存 O(块像素), 数千细胞下不会出现 块×细胞 距离张量)。
+    ids: 真实核 label 数组 (与 centers 对齐); v1.6.1 起领地 mask 输出真实 label,
+    与 matrix_updated/QC 表一致 (缺省回退位置序号 1..N)。
     """
     from scipy.spatial import cKDTree
     H, W = umi.shape
@@ -18,6 +21,7 @@ def rasterize_cells(umi, nuclei_mask, centers, R_i, sigma_blur=3.0):
     elev = -ndi.gaussian_filter(umi, sigma_blur)
     chunk = 1024
     nearest_lab = np.zeros((H, W), np.int32)
+    lab_lut = np.asarray(ids, dtype=np.int32) if ids is not None else None
     tree = cKDTree(centers)
     for y0 in range(0, H, chunk):
         for x0 in range(0, W, chunk):
@@ -29,7 +33,7 @@ def rasterize_cells(umi, nuclei_mask, centers, R_i, sigma_blur=3.0):
             j = j.reshape(y1 - y0, x1 - x0)
             ok = d < R_i[j]
             region[y0:y1, x0:x1][ok] = True
-            nearest_lab[y0:y1, x0:x1][ok] = j[ok] + 1
+            nearest_lab[y0:y1, x0:x1][ok] = lab_lut[j[ok]] if lab_lut is not None else j[ok] + 1
     mask = segmentation.watershed(elev, markers=nuclei_mask.astype(np.int32), mask=region)
     # watershed 可能把像素分给非最近种子, 用 nearest_lab 约束修正
     bad = (mask > 0) & (mask != nearest_lab) & (nearest_lab > 0)
