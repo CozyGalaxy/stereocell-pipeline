@@ -324,7 +324,13 @@ def main():
                         label_colors=colors)
 
     out_matrix = os.path.join(args.outdir, "matrix_updated.csv.gz")
-    scio.write_updated_matrix(args.matrix, out_matrix, assign, sample=args.sample)
+    # v1.6.1: assign 是位置序号 (1..N 对应 ids), 映射回真实核 label,
+    # 保证 matrix_updated 的 cell_id 与 04_cell_qc/cells_x_genes/5NN 严格一致
+    # (假阳性过滤产生标签空洞后两者会发生偏移)
+    pos2label = np.zeros(len(ids) + 1, np.int32)
+    pos2label[1:] = ids
+    scio.write_updated_matrix(args.matrix, out_matrix, pos2label[assign],
+                              sample=args.sample)
     cell_ids = ids
     prefix = os.path.join(args.outdir, "cells_x_genes")
     made = scio.save_cell_by_gene(prefix, cell_ids, expr["genes"],

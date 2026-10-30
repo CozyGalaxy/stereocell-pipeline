@@ -117,7 +117,7 @@ pip install torch --index-url https://download.pytorch.org/whl/cu121   # GPU 可
 pip install cellpose                                                    # GPU 分割后端可选
 ```
 
-## 安装（当前版本 v1.6.0）
+## 安装（当前版本 v1.6.1）
 
 ```bash
 pip install .            # 或 pip install git+https://github.com/<user>/stereocell-pipeline.git
@@ -134,6 +134,15 @@ stereocell-cell-train      --manifest train.tsv --out params_cell.json
 stereocell-cell-segment    --ssdna ssDNA.tif --matrix matrix.txt --outdir out_cells/
 stereocell-run             --smoke-test --outdir /tmp/scell_smoke
 ```
+
+## v1.6.1 修复：输出文件间 cell_id 一致性
+
+- **ID 语义统一**：所有输出的 cell_id 均为真实核 label（`01_nuclei_mask.tif` 的实例编号），
+  包括 `matrix_updated.csv.gz` / `matrix_cell_id.txt.gz` / `cells_x_genes` barcodes /
+  `04_cell_qc.csv` / `cell_qc.csv` / `cell_5nn_dist` / overlay。加 `--sample` 时统一为 `sample.ID`，
+  背景为 `0`。
+- **修复**：v1.6.0 假阳性过滤产生标签空洞后，EM 归属的位置序号 (1..N) 被直接写入更新矩阵，
+  导致矩阵 cell_id 与 QC 表/barcode 偏移错位（无空洞时两者相同，旧结果不受影响）。
 
 ## v1.6.0 新增：假阳性核过滤与逐核/逐细胞质量评估
 

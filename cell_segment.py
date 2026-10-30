@@ -161,7 +161,12 @@ def main():
                             for i in range(k, e)))
     # 文本1b: 更新矩阵
     out_matrix = os.path.join(args.outdir, "matrix_cell_id.txt.gz")
-    scio.write_updated_matrix(args.matrix, out_matrix, assign_f, sample=args.sample)
+    # v1.6.1: assign 是位置序号 (1..N 对应 ids), 映射回真实核 label,
+    # 保证 matrix_cell_id 的 cell_id 与 cell_qc/cells_x_genes/cell_pixel_map 一致
+    _pos2label = np.zeros(len(ids) + 1, np.int32)
+    _pos2label[1:] = ids
+    scio.write_updated_matrix(args.matrix, out_matrix, _pos2label[assign_f],
+                              sample=args.sample)
 
     # 文本2: 多核细胞概率
     log("Step6: 多核细胞(合胞体)概率评估")
