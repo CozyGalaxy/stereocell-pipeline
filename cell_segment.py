@@ -56,10 +56,15 @@ def main():
                     help="输出 CellBender raw 输入 h5ad (真细胞+伪空液滴)")
     ap.add_argument("--pseudo-size", type=int, default=0,
                     help="伪细胞 bin 边长 px (0=自动: sqrt(细胞领地面积中位数))")
-    ap.add_argument("--pseudo-margin", type=int, default=5,
-                    help="细胞领地外扩 px, 该范围内不生成伪细胞")
+    ap.add_argument("--pseudo-mode", choices=["adaptive", "legacy"], default="adaptive",
+                    help="adaptive=ROI+自适应边界+空间分层; legacy=v1.4-v1.6 旧行为")
+    ap.add_argument("--pseudo-margin", type=int, default=0,
+                    help="细胞领地外扩 px; adaptive 默认 0=0.25*lambda, legacy 默认 0=5")
     ap.add_argument("--pseudo-max", type=int, default=50000, help="伪细胞数上限")
     ap.add_argument("--pseudo-min-umi", type=int, default=1, help="伪细胞最少 UMI")
+    ap.add_argument("--pseudo-grid", type=int, default=4, help="空间分层每维窗口数")
+    ap.add_argument("--roi-masks", default=None,
+                    help="00_roi_masks.npz; 缺省尝试核 mask 同目录, 再自动重建")
     args = ap.parse_args()
 
     from scell import io as scio, seeds, export
@@ -195,7 +200,7 @@ def main():
     log(f"5NN 距离矩阵写出 {knn_npz} / {knn_tsv}")
 
     # ---------- CellBender 输入: 真细胞(未过滤) + 伪空液滴 ----------
-    cb_h5ad = None
+    cb_h5ad = cb_pseudo_summary = None
     if args.cellbender:
         log("Step7: CellBender 输入构建 (伪空液滴)")
         from scipy import sparse as _sp
@@ -205,25 +210,41 @@ def main():
             (expr["mid"][keep_m].astype(np.float32),
              (a_all[keep_m] - 1, expr["gene_codes"][keep_m])),
             shape=(len(ids), len(expr["genes"])))
+        roi_full = excl = None
+        if args.pseudo_mode == "adaptive":
+            roi_full, excl = _pseudo_region_masks(args, img, expr, log)
         pmat, pmeta = pseudo.build_pseudo_cells(
             res["cell_mask"], expr["x"], expr["y"], expr["mid"],
             expr["gene_codes"], len(expr["genes"]),
             size=args.pseudo_size, margin=args.pseudo_margin,
-            max_cells=args.pseudo_max, min_umi=args.pseudo_min_umi, log=log)
+            max_cells=args.pseudo_max, min_umi=args.pseudo_min_umi, log=log,
+            roi_mask=roi_full, excl_mask=excl, lam=res["lam"], r95=res["r95"],
+            mode=args.pseudo_mode, grid=args.pseudo_grid)
         real_names = [f"{args.sample}.{int(c)}" if args.sample else str(int(c))
                       for c in ids]
         cb_h5ad = os.path.join(args.outdir, "cellbender_raw.h5ad")
         pseudo.write_cellbender_input(cb_h5ad, real_mat, real_names,
                                       expr["genes"], pmat, args.sample)
-        # 伪细胞坐标表
-        with open(os.path.join(args.outdir, "pseudo_cells.csv"), "w") as f:
-            f.write("pseudo_id,cx,cy,n_umi,bin_size\n")
-            for k in range(len(pmeta["n_umi"])):
-                nm = f"{args.sample}.pseudo{k+1}" if args.sample else f"pseudo{k+1}"
-                f.write(f"{nm},{pmeta['bin_x'][k]},{pmeta['bin_y'][k]},"
-                        f"{pmeta['n_umi'][k]:.0f},{pmeta['bin_size']}\n")
-        log(f"CellBender 输入: {cb_h5ad} ({len(ids)} 真细胞 + "
-            f"{len(pmeta['n_umi'])} 伪空液滴)")
+        # 伪细胞坐标及空间 QC 表
+        import pandas as pd
+        n_pseudo = len(pmeta["n_umi"])
+        names = [f"{args.sample}.pseudo{k+1}" if args.sample else f"pseudo{k+1}"
+                 for k in range(n_pseudo)]
+        pd.DataFrame({
+            "pseudo_id": names, "cx": pmeta["bin_x"], "cy": pmeta["bin_y"],
+            "n_umi": pmeta["n_umi"], "bin_size": pmeta["bin_size"],
+            "dist_to_cell_px": pmeta["dist_to_cell_px"],
+            "distance_stratum": pmeta["distance_stratum"],
+            "local_cell_frac": pmeta["local_cell_frac"],
+            "spatial_window": pmeta["spatial_window"],
+            "density_stratum": pmeta["density_stratum"],
+        }).to_csv(os.path.join(args.outdir, "pseudo_cells.csv"), index=False)
+        cb_pseudo_summary = {
+            k: pmeta[k] for k in ("mode", "margin_px", "bin_size", "roi_frac",
+                                  "n_candidates", "n_selected")}
+        cb_pseudo_summary["distance_counts"] = {
+            s: int((pmeta["distance_stratum"] == s).sum()) for s in ("near", "mid", "far")}
+        log(f"CellBender 输入: {cb_h5ad} ({len(ids)} 真细胞 + {n_pseudo} 伪空液滴)")
 
     export.qc_report(os.path.join(args.outdir, "qc_report.json"),
                      mode="trained" if args.params else "unsupervised",
@@ -240,10 +261,53 @@ def main():
                      n_nuclei_flagged=int((flags != "ok").sum()),
                      sample=args.sample,
                      cellbender_raw=cb_h5ad,
+                     cellbender_pseudo=cb_pseudo_summary,
                      outputs={"matrix": out_matrix, "cell_by_gene": made,
                               "nucleus_morphology": os.path.join(args.outdir, "02_nucleus_morphology.csv"),
                               "knn5_npz": knn_npz, "knn5_tsv": knn_tsv})
     log(f"全部完成。输出目录: {args.outdir}")
+
+
+def _pseudo_region_masks(args, img, expr, log):
+    """读取核分割 ROI 缓存; 旧结果无缓存时从当前矩阵/图像重建。"""
+    from scell import roi as scroi
+    path = args.roi_masks
+    if path is None and args.nuclei_mask:
+        candidate = os.path.join(os.path.dirname(args.nuclei_mask), "00_roi_masks.npz")
+        if os.path.exists(candidate):
+            path = candidate
+    if path is not None:
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"ROI 掩膜不存在: {path}")
+        z = np.load(path, allow_pickle=False)
+        roi_small = z["roi_small"]
+        bin_size = int(z["bin_size"]) if "bin_size" in z.files else 48
+        roi_full = scroi.upsample_mask(roi_small, img.shape, bin_size)
+        excl = z["excl"] if "excl" in z.files else np.zeros(img.shape, bool)
+        if excl.shape == roi_small.shape:
+            excl = scroi.upsample_mask(excl, img.shape, bin_size)
+        if excl.shape != img.shape:
+            raise ValueError(f"ROI 缓存伪影掩膜形状不符: {excl.shape} vs {img.shape}")
+        log(f"伪细胞区域: 复用 {path} (ROI={roi_full.mean():.1%})")
+        return roi_full, excl
+
+    log("伪细胞区域: 无 ROI 缓存, 从当前表达矩阵重建")
+    bin_size = 48
+    H, W = img.shape
+    nb_y, nb_x = (H + bin_size - 1) // bin_size, (W + bin_size - 1) // bin_size
+    hist = np.zeros((nb_y, nb_x), np.float64)
+    bx = np.clip(expr["x"] // bin_size, 0, nb_x - 1)
+    by = np.clip(expr["y"] // bin_size, 0, nb_y - 1)
+    np.add.at(hist, (by, bx), expr["mid"])
+    roi_small = scroi.chip_roi(hist)
+    roi_small = scroi.erode_roi_small(roi_small, scroi.roi_erosion_px(bin_size), bin_size)
+    roi_full = scroi.upsample_mask(roi_small, img.shape, bin_size)
+    excl = scroi.artifact_mask(img, roi_full)
+    np.savez_compressed(os.path.join(args.outdir, "00_pseudo_roi_masks.npz"),
+                        roi_small=roi_small, excl=excl, bin_size=bin_size)
+    log(f"伪细胞区域: ROI={roi_full.mean():.1%}, 伪影占ROI="
+        f"{excl.sum() / max(roi_full.sum(), 1):.1%}")
+    return roi_full, excl
 
 
 def _reindex(assign, pass_mask):

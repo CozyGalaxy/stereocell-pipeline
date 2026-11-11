@@ -117,7 +117,7 @@ pip install torch --index-url https://download.pytorch.org/whl/cu121   # GPU 可
 pip install cellpose                                                    # GPU 分割后端可选
 ```
 
-## 安装（当前版本 v1.6.2）
+## 安装（当前版本 v1.7.0）
 
 ```bash
 pip install .            # 或 pip install git+https://github.com/<user>/stereocell-pipeline.git
@@ -134,6 +134,27 @@ stereocell-cell-train      --manifest train.tsv --out params_cell.json
 stereocell-cell-segment    --ssdna ssDNA.tif --matrix matrix.txt --outdir out_cells/
 stereocell-run             --smoke-test --outdir /tmp/scell_smoke
 ```
+
+## v1.7.0 新增：空间自适应 CellBender 伪空液滴
+
+`cell-segment --cellbender` 默认使用 `--pseudo-mode adaptive`：
+
+- **合法区域限制**：伪液滴只在芯片 ROI 且非伪影区生成。优先复用核 mask 同目录的
+  `00_roi_masks.npz`，也可用 `--roi-masks` 指定；旧结果无缓存时自动从当前矩阵和
+  ssDNA 图重建并保存 `00_pseudo_roi_masks.npz`。`nuclei-segment --matrix` 现在也缓存
+  `00_roi_masks.npz`。
+- **自适应安全边界**：`--pseudo-margin 0` 时取 `clip(0.25*lambda, 3, 50)` px；
+  仍可用正整数固定。近端扩散晕保留为 ambient 主要来源。
+- **空间分层抽样**：超过 `--pseudo-max` 时，按 4×4 空间窗口 × 近/中/远细胞距离 ×
+  局部细胞密度分层，近/中/远权重为 2/1/0.5；固定 seed 可复现。
+- **新增 QC**：`pseudo_cells.csv` 增加到最近细胞距离、距离层级、局部细胞比例、
+  空间窗口和密度层级；`qc_report.json` 增加 `cellbender_pseudo` 摘要。
+- **兼容回退**：`--pseudo-mode legacy` 恢复 v1.4–v1.6 的全图候选、固定 margin=5、
+  全局随机抽样行为。新策略只影响 CellBender 伪液滴，不改变核识别和细胞分割结果。
+- **E8 4000² 裁剪区验证**：101 个真细胞的 mask/QC/CellBender 计数完全一致；adaptive
+  非法 bin=0（legacy=4092），伪液滴 19017（legacy=23048）。强制抽样至 2000 时，
+  近端晕区比例由未抽样的 3.26% 提升至 11.2%。右/下边缘 partial bin 的图外 padding
+  也已禁选，并有单元测试覆盖。
 
 ## v1.6.2 修复：cell_mask 真实核 label + 全输出 ID 一致性审计
 
@@ -200,10 +221,10 @@ stereocell-run             --smoke-test --outdir /tmp/scell_smoke
 
 - **伪空液滴策略**（对照 CellBender"空液滴与真液滴捕获面积/效率一致"假设设计）：
   1. 尺寸自动匹配真实细胞领地面积中位数（边长 = √area_med，通常 55–70px；可用 `--pseudo-size 25` 固定为 25×25）；
-  2. 只排除与细胞领地（外扩 `--pseudo-margin` px，默认 5）重叠的 bin——**扩散晕(halo)内的 bin 保留**，因为扩散 RNA 正是污染细胞的 ambient 来源，远离细胞的区域反而低估真实污染；
-  3. 候选超过 `--pseudo-max`（默认 50000）时随机子采样（固定 seed 可复现）；
-- obs 标注 `droplet_type`（cell/empty）与 `is_pseudo`；伪细胞命名 `sample.pseudoK`；
-- 附 `pseudo_cells.csv`（伪细胞坐标/UMI/bin 尺寸）；anndata 缺失时降级 `cellbender_raw.npz` + barcodes/droplet_type/features tsv。
+  2. v1.7.0 起默认在合法 ROI 内采样，安全边界随 lambda 自适应，并对候选做空间分层抽样；**扩散晕(halo)内的 bin 保留**，因为扩散 RNA 正是污染细胞的 ambient 来源；
+  3. `--pseudo-mode legacy` 可恢复旧版固定 5 px 边界和全局随机子采样；
+- obs 标注 `droplet_type`（cell/empty）与 `is_pseudo`；伪细胞命名 `sample.pseudoK`；这些标签用于追踪，CellBender 不会把它们当作监督真值；
+- 附 `pseudo_cells.csv`（坐标/UMI/bin 尺寸/空间 QC）；anndata 缺失时降级 `cellbender_raw.npz` + barcodes/droplet_type/features tsv（实际运行 CellBender 仍需准备其支持的 h5ad 输入）。
 
 CellBender 参考命令：
 
@@ -258,6 +279,10 @@ python cell_segment.py --ssdna pilot/crop_ssdna.tif --matrix pilot/crop_matrix.t
 | CellParams.margin / dense_margin | 0.20 / 0.35 | top1−top2 最小后验差，拥挤区自动上调（训练学习） |
 | CellParams.w_b | 0.15 | 背景类先验权重 |
 | CellParams.mito_max | 0.10 | 线粒体比例过滤阈值 |
+| --pseudo-mode | adaptive | CellBender 伪液滴：ROI+自适应边界+空间分层；legacy 回退旧行为 |
+| --pseudo-margin | 0（自动） | adaptive=clip(0.25λ,3,50) px；legacy=5 px |
+| --pseudo-max / --pseudo-min-umi | 50000 / 1 | 伪液滴数上限 / 最低 UMI |
+| --pseudo-grid | 4 | 空间分层每维窗口数 |
 
 ## 真实数据验证（Y40360CC, 果蝇 0.5d 雌幼虫, 2000×2000 示例窗）
 

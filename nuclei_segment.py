@@ -77,6 +77,11 @@ def main():
         if not args.no_excl:
             excl_mask = scroi.artifact_mask(img, roi_mask, nuc_radius=p.min_distance)
             log(f"  伪影排除区占 ROI {excl_mask.sum() / max(roi_mask.sum(), 1):.1%}")
+        np.savez_compressed(os.path.join(args.outdir, "00_roi_masks.npz"),
+                            roi_small=roi_small,
+                            excl=(excl_mask if excl_mask is not None
+                                  else np.zeros(img.shape, bool)),
+                            bin_size=48)
     if args.reliable and args.matrix:
         expr = scio.load_expression(args.matrix)
         rel = scio.reliable_label_ids(scio.load_reliable(args.reliable))

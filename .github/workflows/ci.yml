@@ -32,6 +32,9 @@ jobs:
           stereocell-nuclei-segment --help > /dev/null
           stereocell-cell-segment --help > /dev/null
 
+      - name: Run pseudo-droplet unit tests
+        run: python -m unittest discover -s tests -v
+
       - name: Run smoke test (synthetic StereoCell data, full pipeline)
         run: stereocell-run --smoke-test --outdir smoke_out --force
 
